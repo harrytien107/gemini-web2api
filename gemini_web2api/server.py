@@ -1,17 +1,45 @@
 """HTTP server: OpenAI-compatible API endpoints."""
+import hashlib
 import json
 import time
 import uuid
 import re
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
 from .config import CONFIG
-from .models import MODELS, resolve_model
-from .gemini import generate, generate_stream, log
+from .models import MODELS, configured_model_combos, resolve_model_chain
+from .gemini import GeminiUpstreamError, generate, generate_stream, log, refresh_auth, reset_conversation
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
+
+
+_chat_history_lock = threading.Lock()
+_chat_history = []
+
+
+def _incremental_chat_messages(messages: list) -> list:
+    """Return only messages Gemini has not already seen, resetting on a new overlay chat."""
+    if not isinstance(messages, list):
+        return []
+    with _chat_history_lock:
+        previous = list(_chat_history)
+    continues = bool(previous) and len(messages) >= len(previous) and messages[:len(previous)] == previous
+    if previous and not continues:
+        reset_conversation()
+    if not continues:
+        return messages
+    new_messages = messages[len(previous):]
+    # ponytail: one upstream session serves one overlay; add a client conversation ID if multiplexing clients.
+    return [message for message in new_messages if message.get("role", "user") != "assistant"]
+
+
+def _commit_chat_messages(messages: list) -> None:
+    global _chat_history
+    with _chat_history_lock:
+        _chat_history = list(messages)
 
 
 def _usage(prompt: str, text: str) -> dict:
@@ -20,30 +48,143 @@ def _usage(prompt: str, text: str) -> dict:
     return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
 
 
+def _model_catalog() -> dict:
+    catalog = dict(MODELS)
+    for name, configured in configured_model_combos().items():
+        if isinstance(configured, list):
+            strategy, models = "fallback", configured
+        elif isinstance(configured, dict):
+            strategy = configured.get("strategy", "fallback")
+            models = configured.get("models")
+        else:
+            continue
+        if (isinstance(name, str) and name and isinstance(models, list) and models
+                and strategy in ("fallback", "round_robin")):
+            catalog[name] = {"desc": f"Configured model {strategy} chain"}
+    return catalog
+
+
+def _generate_attempts(prompt, attempts, file_refs, combo):
+    errors = []
+    terminal_errors = []
+    for name, model_id, think_mode, extra_fields in attempts:
+        log(f"Model {name}: calling")
+        caught = None
+        try:
+            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            if text:
+                log(f"Model {name}: success")
+                return text
+            error = "empty response"
+        except Exception as e:
+            caught = e
+            error = str(e)
+        log(f"Model {name}: failed ({error})")
+        errors.append(f"{name}: {error}")
+        if isinstance(caught, GeminiUpstreamError):
+            terminal_errors.append(caught)
+        if not combo:
+            raise caught if caught is not None else RuntimeError(error)
+    if len(terminal_errors) == len(errors) and terminal_errors:
+        raise terminal_errors[-1]
+    raise RuntimeError("all combo models failed: " + "; ".join(errors))
+
+
+def _generate_stream_attempts(prompt, attempts, file_refs, combo):
+    errors = []
+    terminal_errors = []
+    for name, model_id, think_mode, extra_fields in attempts:
+        emitted = False
+        caught = None
+        log(f"Model {name}: calling")
+        try:
+            for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                if delta:
+                    emitted = True
+                    yield delta
+            if emitted:
+                log(f"Model {name}: success")
+                return
+            error = "empty response"
+        except Exception as e:
+            if emitted:
+                log(f"Model {name}: failed after output started ({e})")
+                raise
+            caught = e
+            error = str(e)
+        log(f"Model {name}: failed ({error})")
+        errors.append(f"{name}: {error}")
+        if isinstance(caught, GeminiUpstreamError):
+            terminal_errors.append(caught)
+        if not combo:
+            raise caught if caught is not None else RuntimeError(error)
+    if len(terminal_errors) == len(errors) and terminal_errors:
+        raise terminal_errors[-1]
+    raise RuntimeError("all combo models failed: " + "; ".join(errors))
+
+
+class ImageAuthenticationRequired(ValueError):
+    pass
+
+
+def _upstream_error_response(error: Exception, has_images: bool) -> tuple[str, int]:
+    if has_images and isinstance(error, GeminiUpstreamError) and error.code == 1100:
+        return (
+            "Gemini rejected the image because the exported Google session is expired or unauthenticated. "
+            "Open Gemini while signed in, refresh the page, export a new gemini-auth.json, replace the file "
+            "beside gemini-web2api-cookie.exe, then retry.",
+            401,
+        )
+    return f"upstream error: {error}", 502
+
+
 def _upload_images(images: list) -> list:
-    """Upload images and return list of file references. Returns None if no images."""
+    """Upload each unique image once and return Gemini file references."""
     if not images:
         return None
-    file_refs = []
+    if not refresh_auth().get("cookie"):
+        log(f"Image batch rejected: count={len(images)} auth=anonymous")
+        raise ImageAuthenticationRequired(
+            "image input requires authenticated Gemini cookies; use gemini-web2api-cookie.exe"
+        )
+
+    unique_images = []
+    seen_sources = set()
+    seen_content = set()
     for item in images:
         if not (isinstance(item, tuple) and len(item) == 2):
             continue
         data, mime = item
         if isinstance(data, str):
+            if data in seen_sources:
+                continue
+            seen_sources.add(data)
             data = fetch_image_bytes(data)
             mime = mime or "image/png"
         if not data:
             raise RuntimeError("image fetch failed")
+        fingerprint = hashlib.sha256(data).digest()
+        if fingerprint in seen_content:
+            continue
+        seen_content.add(fingerprint)
+        unique_images.append((data, mime))
+
+    log(f"Image batch: count={len(images)} unique={len(unique_images)} auth=authenticated")
+    file_refs = []
+    for data, mime in unique_images:
         mime = detect_image_mime(data, mime or "image/png")
         try:
-            ref = upload_image(data, "image.png", mime or "image/png")
-            file_refs.append(ref)
+            filename = "image.png"
+            ref = upload_image(data, filename, mime or "image/png")
+            file_refs.append((ref, filename))
         except Exception as e:
             raise RuntimeError(f"image upload failed: {e}") from e
     return file_refs if file_refs else None
 
 
 class GeminiHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, fmt, *args):
         client_ip = self.client_address[0] if self.client_address else "-"
         log(f"{client_ip} {fmt % args}")
@@ -62,7 +203,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
+
+    def _write_sse(self, data):
+        if isinstance(data, str):
+            data = data.encode()
+        self.wfile.write(f"{len(data):X}\r\n".encode() + data + b"\r\n")
+        self.wfile.flush()
+
+    def _finish_sse(self):
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
 
     def _parse_body(self, body: bytes) -> dict:
         try:
@@ -124,6 +276,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
+            refresh_auth()
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
@@ -131,13 +284,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
-                    for n, c in MODELS.items()
+                    for n, c in _model_catalog().items()
                 ]})
             elif self.path.startswith("/v1beta/models"):
                 self.send_json({"models": [
                     {"name": f"models/{n}", "displayName": n, "description": c["desc"],
                      "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
-                    for n, c in MODELS.items()
+                    for n, c in _model_catalog().items()
                 ]})
             elif self.path == "/":
                 self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
@@ -148,6 +301,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            refresh_auth()
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
@@ -178,15 +332,25 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if req is None:
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
             return
-        model_name, model_id, think_mode, err, extra_fields = resolve_model(
-            req.get("model", CONFIG["default_model"]))
+        requested_model = req.get("model")
+        if not isinstance(requested_model, str) or not requested_model:
+            self.send_json({"error": {"message": "model is required"}}, 400)
+            return
+        model_name, attempts, err = resolve_model_chain(requested_model)
+        combo = requested_model in configured_model_combos()
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
 
         tools = req.get("tools")
         tool_choice = req.get("tool_choice", "auto")
-        prompt, images = messages_to_prompt(req.get("messages", []), tools, tool_choice)
+        messages = req.get("messages", [])
+        incremental_messages = _incremental_chat_messages(messages)
+        prompt, images = messages_to_prompt(incremental_messages, tools, tool_choice)
+        log(
+            f"Chat request: model={requested_model} messages={len(messages) if isinstance(messages, list) else 0} "
+            f"images={len(images)} stream={bool(req.get('stream', False))}"
+        )
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
@@ -195,6 +359,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         try:
             file_refs = _upload_images(images)
+        except ImageAuthenticationRequired as e:
+            self.send_json({"error": {"message": str(e)}}, 400)
+            return
         except RuntimeError as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -213,18 +380,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         "finish_reason": None,
                     }],
                 }
-                self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
-                self.wfile.flush()
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                self._write_sse(f"data: {json.dumps(first_chunk)}\n\n")
+                for delta in _generate_stream_attempts(prompt, attempts, file_refs, combo):
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
-                    self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
-                    self.wfile.flush()
+                    self._write_sse(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n")
                 end = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                        "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-                self.wfile.write(f"data: {json.dumps(end)}\n\n".encode())
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+                self._write_sse(f"data: {json.dumps(end)}\n\n")
+                self._write_sse(b"data: [DONE]\n\n")
+                self._finish_sse()
+                _commit_chat_messages(messages)
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:
@@ -232,11 +398,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            text = _generate_attempts(prompt, attempts, file_refs, combo)
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            message, status = _upstream_error_response(e, bool(images))
+            self.send_json({"error": {"message": message}}, status)
             return
 
+        _commit_chat_messages(messages)
         tool_calls = None
         if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
@@ -249,9 +417,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self._start_sse()
             chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                      "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
-            self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
+            self._write_sse(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n")
+            self._write_sse(b"data: [DONE]\n\n")
+            self._finish_sse()
         else:
             self.send_json({
                 "id": cid, "object": "chat.completion", "created": int(time.time()),
@@ -268,8 +436,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if req is None:
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
             return
-        model_name, model_id, think_mode, err, extra_fields = resolve_model(
-            req.get("model", CONFIG["default_model"]))
+        requested_model = req.get("model")
+        if not isinstance(requested_model, str) or not requested_model:
+            self.send_json({"error": {"message": "model is required"}}, 400)
+            return
+        model_name, attempts, err = resolve_model_chain(requested_model)
+        combo = requested_model in configured_model_combos()
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
@@ -325,9 +497,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         try:
             file_refs = _upload_images(images)
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            text = _generate_attempts(prompt, attempts, file_refs, combo)
+        except ImageAuthenticationRequired as e:
+            self.send_json({"error": {"message": str(e)}}, 400)
+            return
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            message, status = _upstream_error_response(e, bool(images))
+            self.send_json({"error": {"message": message}}, status)
             return
 
         tool_calls = None
@@ -357,8 +533,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     "sequence_number": sequence_number,
                     **fields,
                 }
-                self.wfile.write(
-                    f"event: {event_type}\ndata: {json.dumps(event)}\n\n".encode()
+                self._write_sse(
+                    f"event: {event_type}\ndata: {json.dumps(event)}\n\n"
                 )
 
             usage = {
@@ -479,7 +655,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     "usage": usage,
                 },
             )
-            self.wfile.flush()
+            self._finish_sse()
         else:
             self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
                             "model": model_name, "output": output,
@@ -493,8 +669,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
             return
         m = re.match(r'/v1beta/models/([^:?]+)', self.path)
-        model_name = m.group(1) if m else CONFIG["default_model"]
-        model_name, model_id, think_mode, err, extra_fields = resolve_model(model_name)
+        if not m:
+            self.send_json({"error": {"message": "model is required in URL"}}, 400)
+            return
+        requested_model = m.group(1)
+        model_name, attempts, err = resolve_model_chain(requested_model)
+        combo = requested_model in configured_model_combos()
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
@@ -509,6 +689,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         try:
             file_refs = _upload_images(images)
+        except ImageAuthenticationRequired as e:
+            self.send_json({"error": {"message": str(e)}}, 400)
+            return
         except RuntimeError as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -518,7 +701,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             try:
                 self._start_sse()
                 full_text = ""
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                for delta in _generate_stream_attempts(prompt, attempts, file_refs, combo):
                     if not delta:
                         continue
                     full_text += delta
@@ -526,8 +709,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         "candidates": [{"content": {"parts": [{"text": delta}], "role": "model"}, "index": 0}],
                         "modelVersion": model_name,
                     }
-                    self.wfile.write(f"data: {json.dumps(chunk_obj, ensure_ascii=False)}\n\n".encode())
-                    self.wfile.flush()
+                    self._write_sse(f"data: {json.dumps(chunk_obj, ensure_ascii=False)}\n\n")
                 final_chunk = {
                     "candidates": [{"finishReason": "STOP", "index": 0}],
                     "usageMetadata": {
@@ -537,8 +719,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     },
                     "modelVersion": model_name,
                 }
-                self.wfile.write(f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n".encode())
-                self.wfile.flush()
+                self._write_sse(f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n")
+                self._finish_sse()
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:
@@ -546,9 +728,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            text = _generate_attempts(prompt, attempts, file_refs, combo)
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            message, status = _upstream_error_response(e, bool(images))
+            self.send_json({"error": {"message": message}}, status)
             return
 
         if not text:
@@ -585,8 +768,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if stream:
             self._start_sse()
-            self.wfile.write(f"data: {json.dumps(response_obj, ensure_ascii=False)}\n\n".encode())
-            self.wfile.flush()
+            self._write_sse(f"data: {json.dumps(response_obj, ensure_ascii=False)}\n\n")
+            self._finish_sse()
         else:
             self.send_json(response_obj)
 

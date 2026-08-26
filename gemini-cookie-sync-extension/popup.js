@@ -87,8 +87,11 @@ function scoreCookie(cookie) {
   return score;
 }
 
-async function readGoogleCookies() {
-  const stores = await chrome.cookies.getAllCookieStores();
+async function readGoogleCookies(preferredStoreId = null) {
+  const allStores = await chrome.cookies.getAllCookieStores();
+  const stores = preferredStoreId === null
+    ? allStores
+    : allStores.filter((store) => store.id === preferredStoreId);
   const deduped = new Map();
 
   for (const store of stores) {
@@ -258,10 +261,9 @@ async function readGeminiPageMetadata(tabs) {
 }
 
 async function buildInspection() {
-  const [cookies, tabs] = await Promise.all([
-    readGoogleCookies(),
-    chrome.tabs.query({ url: "https://gemini.google.com/*" })
-  ]);
+  const tabs = await chrome.tabs.query({ url: "https://gemini.google.com/*" });
+  const tab = chooseGeminiTab(tabs);
+  const cookies = await readGoogleCookies(tab?.cookieStoreId ?? null);
 
   const selected = selectBestCookies(cookies);
   const validation = validateSelection(selected);
@@ -296,7 +298,7 @@ function inspectionMessage(info) {
   } = info;
 
   const lines = [
-    `Found ${cookies.length} cookie(s) across Google domains.`,
+    `Found ${cookies.length} cookie(s) in the active Gemini profile.`,
     "",
     `SAPISID: ${selected.has("SAPISID") ? "present" : "missing"}`,
     `Session cookie: ${validation.sessionCookie || "missing"}`,
@@ -334,19 +336,15 @@ function buildCookieString(info) {
 }
 
 async function downloadJson(filename, payload) {
-  const blob = new Blob([JSON.stringify(payload, null, 2) + "\n"], {
-    type: "application/json;charset=utf-8"
-  });
-  const url = URL.createObjectURL(blob);
+  const content = JSON.stringify(payload, null, 2) + "\n";
+  const url = `data:application/json;charset=utf-8,${encodeURIComponent(content)}`;
 
   await chrome.downloads.download({
     url,
     filename,
-    saveAs: true,
-    conflictAction: "uniquify"
+    saveAs: false,
+    conflictAction: "overwrite"
   });
-
-  setTimeout(() => URL.revokeObjectURL(url), 30000);
 }
 
 openButton.addEventListener("click", async () => {

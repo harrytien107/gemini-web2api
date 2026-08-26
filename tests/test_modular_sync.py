@@ -1,15 +1,41 @@
 import http.client
+import subprocess
 import base64
 import json
+import os
+import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 from urllib.parse import parse_qs
 
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
-from gemini_web2api.gemini import _build_payload
-from gemini_web2api.server import GeminiHandler, ThreadedServer
+from gemini_web2api.gemini import (
+    _build_headers,
+    _build_payload,
+    _get_url,
+    GeminiUpstreamError,
+    auth_status,
+    extract_response_text,
+    generate,
+    refresh_auth,
+    reset_conversation,
+)
+from gemini_web2api import gemini as gemini_module
+from gemini_web2api import multimodal
+from gemini_web2api.models import resolve_model_chain
+from gemini_web2api.server import (
+    GeminiHandler,
+    ThreadedServer,
+    _generate_attempts,
+    _generate_stream_attempts,
+    _commit_chat_messages,
+    _incremental_chat_messages,
+    _model_catalog,
+)
 from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt
+from gemini_web2api.tray import _restart_app, _restart_command
 
 
 def _decode_payload(payload):
@@ -34,6 +60,300 @@ def _decode_sse(body):
     return events
 
 
+class AuthReloadTests(unittest.TestCase):
+    def setUp(self):
+        self.original_config = dict(CONFIG)
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.auth_path = os.path.join(self.temp_dir.name, "gemini-auth.json")
+        CONFIG.update({
+            "cookie_file": self.auth_path,
+            "auth_user": "config-user",
+            "xsrf_token": "config-xsrf",
+            "gemini_bl": "config-bl",
+            "log_requests": False,
+        })
+
+    def tearDown(self):
+        CONFIG.clear()
+        CONFIG.update(self.original_config)
+        refresh_auth(force=True)
+        self.temp_dir.cleanup()
+
+    def write_auth(self, **overrides):
+        payload = {
+            "cookie": "SID=fake; SAPISID=fake-sapisid",
+            "sapisid": "fake-sapisid",
+            "auth_user": None,
+            "xsrf_token": "auth-xsrf",
+            "gemini_bl": "auth-bl",
+            **overrides,
+        }
+        with open(self.auth_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.utime(self.auth_path, None)
+        return payload
+
+    def test_extension_schema_overrides_auth_config_fields(self):
+        self.write_auth()
+        auth = refresh_auth(force=True)
+
+        self.assertEqual(auth["cookie"], "SID=fake; SAPISID=fake-sapisid")
+        self.assertEqual(auth["sapisid"], "fake-sapisid")
+        self.assertIsNone(auth["auth_user"])
+        self.assertEqual(auth["xsrf_token"], "auth-xsrf")
+        self.assertEqual(auth["gemini_bl"], "auth-bl")
+        self.assertNotIn("/u/", _get_url(auth))
+        self.assertIn("bl=auth-bl", _get_url(auth))
+        self.assertNotIn("X-Goog-AuthUser", _build_headers(auth))
+        self.assertEqual(parse_qs(_build_payload("hello", 1, 4, auth=auth))["at"][0], "auth-xsrf")
+
+    def test_missing_metadata_falls_back_to_config(self):
+        self.write_auth(auth_user="2", xsrf_token=None)
+        with open(self.auth_path, "w", encoding="utf-8") as f:
+            json.dump({"cookie": "SAPISID=fake-sapisid", "sapisid": "fake-sapisid"}, f)
+
+        auth = refresh_auth(force=True)
+
+        self.assertEqual(auth["auth_user"], "config-user")
+        self.assertEqual(auth["xsrf_token"], "config-xsrf")
+        self.assertEqual(auth["gemini_bl"], "config-bl")
+
+    def test_empty_generated_template_uses_anonymous_auth(self):
+        with open(self.auth_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "cookie": "",
+                "sapisid": None,
+                "auth_user": None,
+                "xsrf_token": None,
+                "gemini_bl": None,
+            }, f)
+
+        auth = refresh_auth(force=True)
+        status = auth_status()
+
+        self.assertEqual(auth["cookie"], "")
+        self.assertIsNone(auth["sapisid"])
+        self.assertTrue(status["exists"])
+        self.assertFalse(status["loaded"])
+        self.assertIsNone(status["error"])
+
+    def test_hot_reload_and_invalid_json_keep_last_known_good(self):
+        self.write_auth(xsrf_token="first")
+        self.assertEqual(refresh_auth(force=True)["xsrf_token"], "first")
+        self.write_auth(xsrf_token="second", cookie="SID=second; SAPISID=second")
+        self.assertEqual(refresh_auth()["xsrf_token"], "second")
+
+        with open(self.auth_path, "w", encoding="utf-8") as f:
+            f.write("{")
+        os.utime(self.auth_path, None)
+        auth = refresh_auth()
+
+        self.assertEqual(auth["xsrf_token"], "second")
+        self.assertEqual(auth["cookie"], "SID=second; SAPISID=second")
+        self.assertIsNotNone(auth_status()["error"])
+
+    def test_concurrent_refresh_returns_complete_snapshots(self):
+        self.write_auth(auth_user="3", xsrf_token="thread-xsrf", gemini_bl="thread-bl")
+        refresh_auth(force=True)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            snapshots = list(pool.map(lambda _: refresh_auth(), range(64)))
+
+        self.assertTrue(all(snapshot["cookie"] == "SID=fake; SAPISID=fake-sapisid" for snapshot in snapshots))
+        self.assertTrue(all(snapshot["auth_user"] == "3" for snapshot in snapshots))
+        self.assertTrue(all(snapshot["xsrf_token"] == "thread-xsrf" for snapshot in snapshots))
+        self.assertTrue(all(snapshot["gemini_bl"] == "thread-bl" for snapshot in snapshots))
+
+    def test_extract_response_text_accepts_short_wrb_line(self):
+        inner = [None] * 5
+        inner[4] = [[None, ["API_TEST_OK"]]]
+        raw = json.dumps([["wrb.fr", None, json.dumps(inner)]])
+
+        self.assertLess(len(raw), 200)
+        self.assertEqual(extract_response_text(raw), "API_TEST_OK")
+
+    def test_extract_response_text_reports_nested_upstream_error(self):
+        frame = ["wrb.fr", None, None, None, None, [3, None, [[None, [1003]]]]]
+
+        with self.assertRaisesRegex(RuntimeError, "error 1003"):
+            extract_response_text(json.dumps([frame]))
+
+    @mock.patch("gemini_web2api.gemini.urllib.request.urlopen")
+    def test_generate_retries_empty_upstream_response(self, urlopen):
+        CONFIG["retry_attempts"] = 2
+        CONFIG["retry_delay_sec"] = 0
+        empty_response = mock.Mock()
+        empty_response.read.return_value = b""
+        good_response = mock.Mock()
+        inner = [None] * 5
+        inner[4] = [[None, ["API_TEST_OK"]]]
+        good_response.read.return_value = json.dumps(
+            [["wrb.fr", None, json.dumps(inner)]]
+        ).encode()
+        urlopen.side_effect = [empty_response, good_response]
+
+        self.assertEqual(generate("test", 1, 4), "API_TEST_OK")
+        self.assertEqual(urlopen.call_count, 2)
+
+    @mock.patch("gemini_web2api.gemini.urllib.request.urlopen")
+    def test_generate_does_not_retry_terminal_upstream_rejection(self, urlopen):
+        CONFIG["retry_attempts"] = 3
+        rejected = mock.Mock()
+        rejected.read.return_value = b"BardErrorInfo [1100]"
+        urlopen.return_value = rejected
+
+        with self.assertRaisesRegex(GeminiUpstreamError, "error 1100"):
+            generate("test", 1, 4)
+
+        urlopen.assert_called_once()
+
+
+class MultimodalAuthTests(unittest.TestCase):
+    def setUp(self):
+        self.original_cache = dict(multimodal._page_tokens_cache)
+        multimodal._page_tokens_cache.update({"tokens": {}, "ts": 0, "auth_key": None})
+
+    def tearDown(self):
+        multimodal._page_tokens_cache.clear()
+        multimodal._page_tokens_cache.update(self.original_cache)
+
+    @mock.patch("gemini_web2api.multimodal._upload_opener.open")
+    def test_page_tokens_use_account_scoped_url_and_headers(self, open_page):
+        response = mock.Mock()
+        response.read.return_value = (
+            b'<script>"qKIAYe":"push-token","Ylro7b":"pctx-token",'
+            b'"SNlM0e":"fresh-at","cfb2h":"fresh-bl",'
+            b'"FdrFJe":"fresh-session"</script>'
+        )
+        open_page.return_value = response
+        auth = {
+            "cookie": "SID=fake; SAPISID=fake-sapisid",
+            "sapisid": "fake-sapisid",
+            "auth_user": "3",
+        }
+
+        tokens = multimodal._get_page_tokens(auth)
+
+        self.assertEqual(tokens, {
+            "push_id": "push-token",
+            "pctx": "pctx-token",
+            "at": "fresh-at",
+            "bl": "fresh-bl",
+            "session_id": "fresh-session",
+        })
+        request = open_page.call_args.args[0]
+        headers = {key.lower(): value for key, value in request.header_items()}
+        self.assertEqual(request.full_url, "https://gemini.google.com/u/3/app")
+        self.assertEqual(headers["x-goog-authuser"], "3")
+        self.assertEqual(headers["referer"], "https://gemini.google.com/u/3/app")
+        self.assertEqual(headers["origin"], "https://gemini.google.com")
+        self.assertEqual(headers["cookie"], auth["cookie"])
+        self.assertTrue(headers["authorization"].startswith("SAPISIDHASH "))
+
+    @mock.patch("gemini_web2api.multimodal._get_page_tokens")
+    def test_page_token_cache_invalidates_when_auth_changes(self, get_page_tokens):
+        get_page_tokens.side_effect = [
+            {"push_id": "first", "pctx": "first"},
+            {"push_id": "second", "pctx": "second"},
+        ]
+        first = {"cookie": "SID=first", "sapisid": None, "auth_user": "1"}
+        second = {"cookie": "SID=second", "sapisid": None, "auth_user": "1"}
+
+        self.assertEqual(multimodal._cached_page_tokens(first)["push_id"], "first")
+        self.assertEqual(multimodal._cached_page_tokens(first)["push_id"], "first")
+        self.assertEqual(multimodal._cached_page_tokens(second)["push_id"], "second")
+        self.assertEqual(get_page_tokens.call_count, 2)
+
+    @mock.patch("gemini_web2api.multimodal._cached_page_tokens")
+    @mock.patch("gemini_web2api.multimodal.refresh_auth")
+    def test_upload_rejects_missing_page_metadata(self, refresh_auth_mock, cached_tokens):
+        refresh_auth_mock.return_value = {
+            "cookie": "SID=fake",
+            "sapisid": None,
+            "auth_user": "2",
+        }
+        cached_tokens.return_value = {}
+
+        with self.assertRaisesRegex(RuntimeError, "omitted upload metadata"):
+            multimodal.upload_image(b"image")
+
+    @mock.patch("gemini_web2api.multimodal._upload_opener.open")
+    @mock.patch("gemini_web2api.multimodal._cached_page_tokens")
+    @mock.patch("gemini_web2api.multimodal.refresh_auth")
+    def test_upload_uses_single_multipart_request(
+        self, refresh_auth_mock, cached_tokens, open_upload
+    ):
+        refresh_auth_mock.return_value = {
+            "cookie": "SID=fake",
+            "sapisid": None,
+            "auth_user": "2",
+        }
+        cached_tokens.return_value = {"push_id": "push-token"}
+        open_upload.return_value.read.return_value = b"/uploaded/image-ref"
+
+        ref = multimodal.upload_image(b"image-bytes", "photo.png", "image/png")
+
+        self.assertEqual(ref, "/uploaded/image-ref")
+        self.assertEqual(open_upload.call_count, 1)
+        request = open_upload.call_args.args[0]
+        headers = {key.lower(): value for key, value in request.header_items()}
+        self.assertEqual(request.full_url, "https://content-push.googleapis.com/upload")
+        self.assertEqual(request.get_method(), "POST")
+        self.assertIn("multipart/form-data; boundary=", headers["content-type"])
+        self.assertEqual(headers["push-id"], "push-token")
+        self.assertEqual(headers["x-goog-authuser"], "2")
+        self.assertNotIn("x-goog-upload-command", headers)
+        self.assertIn(b'name="file"; filename="photo.png"', request.data)
+        self.assertIn(b"Content-Type: image/png", request.data)
+        self.assertIn(b"image-bytes", request.data)
+
+
+class FileLoggingTests(unittest.TestCase):
+    def test_frozen_log_appends_beside_executable(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                mock.patch.dict(CONFIG, {"log_requests": True}), \
+                mock.patch.object(gemini_module.sys, "frozen", True, create=True), \
+                mock.patch.object(
+                    gemini_module.sys,
+                    "executable",
+                    os.path.join(temp_dir, "gemini-web2api.exe"),
+                ):
+            gemini_module.log("Model gemini-3.7-flash: success")
+
+            with open(
+                os.path.join(temp_dir, "gemini-web2api.log"),
+                encoding="utf-8",
+            ) as file:
+                content = file.read()
+
+        self.assertIn("Model gemini-3.7-flash: success", content)
+
+
+class TrayTests(unittest.TestCase):
+    @mock.patch("gemini_web2api.tray.sys")
+    def test_restart_command_preserves_args_without_duplicate_tray(self, tray_sys):
+        tray_sys.argv = ["app.exe", "--tray", "--port", "8082"]
+        tray_sys.executable = "app.exe"
+        tray_sys.frozen = True
+
+        self.assertEqual(_restart_command(), ["app.exe", "--port", "8082"])
+
+    @mock.patch("gemini_web2api.tray.subprocess.Popen")
+    @mock.patch("gemini_web2api.tray.sys")
+    def test_restart_app_spawns_detached_frozen_executable(self, tray_sys, popen):
+        tray_sys.argv = ["app.exe", "--tray", "--port", "8082"]
+        tray_sys.executable = "app.exe"
+        tray_sys.frozen = True
+        tray_sys.platform = "win32"
+
+        _restart_app()
+
+        popen.assert_called_once_with(
+            ["app.exe", "--port", "8082"],
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
+        )
+
+
 class PayloadPersistenceTests(unittest.TestCase):
     def setUp(self):
         self.original_config = dict(CONFIG)
@@ -53,6 +373,28 @@ class PayloadPersistenceTests(unittest.TestCase):
         self.assertEqual(inner[41], [2])
         self.assertIsNone(inner[45])
 
+    def test_runtime_page_metadata_updates_generation_url_and_token(self):
+        auth = {
+            "auth_user": "",
+            "cookie": "SID=fake",
+            "sapisid": None,
+            "xsrf_token": "stale-at",
+            "gemini_bl": "stale-bl",
+        }
+        from gemini_web2api.gemini import set_runtime_page_metadata
+        set_runtime_page_metadata(auth, {
+            "at": "fresh-at",
+            "bl": "fresh-bl",
+            "session_id": "fresh-session",
+        })
+
+        payload = parse_qs(_build_payload("hello", 1, 4, auth=auth))
+        url = _get_url(auth)
+
+        self.assertEqual(payload["at"], ["fresh-at"])
+        self.assertIn("bl=fresh-bl", url)
+        self.assertIn("f.sid=fresh-session", url)
+
     def test_temporary_chat_payload(self):
         CONFIG["temporary_chats"] = True
 
@@ -61,11 +403,51 @@ class PayloadPersistenceTests(unittest.TestCase):
         self.assertEqual(inner[41], [1])
         self.assertEqual(inner[45], 1)
 
+    def test_payload_reuses_conversation_metadata(self):
+        auth = {
+            "auth_user": "",
+            "cookie": "SID=conversation-test",
+            "sapisid": None,
+            "xsrf_token": None,
+            "gemini_bl": "test-bl",
+        }
+        reset_conversation()
+        gemini_module._update_conversation_metadata(
+            json.dumps([["wrb.fr", None, json.dumps([None, ["cid", "rid", "rcid"]])]]),
+            auth,
+        )
+
+        inner = _decode_payload(_build_payload("follow up", 1, 4, auth=auth))
+
+        self.assertEqual(inner[2][:3], ["cid", "rid", "rcid"])
+
     def test_payload_includes_uploaded_image_refs(self):
-        inner = _decode_payload(_build_payload("describe", 1, 4, ["/uploaded/image-ref"]))
+        inner = _decode_payload(_build_payload(
+            "describe", 1, 4, [("/uploaded/image-ref", "image.png")],
+            request_uuid="REQUEST-UUID",
+        ))
 
         self.assertEqual(inner[0][0], "describe")
-        self.assertEqual(inner[0][3], [[None, None, "/uploaded/image-ref"]])
+        self.assertEqual(inner[0][3], [[["/uploaded/image-ref"], "image.png"]])
+        self.assertEqual(len(inner), 81)
+        self.assertEqual(inner[4].isalnum(), True)
+        self.assertEqual(inner[6], [1])
+        self.assertEqual(inner[17], [[0]])
+        self.assertEqual(inner[55], [[1]])
+        self.assertEqual(inner[59], "REQUEST-UUID")
+        self.assertEqual(inner[80], 1)
+
+    def test_generation_headers_include_matching_request_uuid(self):
+        headers = _build_headers({
+            "auth_user": "",
+            "cookie": "",
+            "sapisid": "",
+        }, "REQUEST-UUID")
+
+        self.assertEqual(
+            json.loads(headers["X-Goog-Ext-525005358-Jspb"]),
+            ["REQUEST-UUID", 1],
+        )
 
 
 class MessageParsingTests(unittest.TestCase):
@@ -138,6 +520,156 @@ class MessageParsingTests(unittest.TestCase):
         self.assertEqual(images, [])
 
 
+class ComboModelTests(unittest.TestCase):
+    def setUp(self):
+        self.original_config = dict(CONFIG)
+        CONFIG["log_requests"] = False
+        CONFIG["model_combos"] = {
+            "gemini-combo": ["gemini-3.1-pro", "gemini-3.7-flash"],
+            "gemini-deep": [
+                "gemini-3.7-flash-thinking@think=0",
+                "gemini-3.6-flash-thinking@think=0",
+                "gemini-3.5-flash-thinking@think=0",
+            ],
+            "gemini-balanced-test": {
+                "strategy": "round_robin",
+                "models": ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"],
+            },
+        }
+
+    def tearDown(self):
+        CONFIG.clear()
+        CONFIG.update(self.original_config)
+
+    def test_fallback_combo_is_exposed_when_configured(self):
+        self.assertIn("gemini-combo", _model_catalog())
+        name, attempts, error = resolve_model_chain("gemini-combo")
+        self.assertEqual(name, "gemini-combo")
+        self.assertIsNone(error)
+        self.assertEqual([attempt[0] for attempt in attempts], ["gemini-3.1-pro", "gemini-3.7-flash"])
+
+    def test_named_combo_is_exposed_and_resolves_think_override(self):
+        self.assertIn("gemini-deep", _model_catalog())
+        name, attempts, error = resolve_model_chain("gemini-deep")
+        self.assertEqual(name, "gemini-deep")
+        self.assertIsNone(error)
+        self.assertEqual(
+            [attempt[0] for attempt in attempts],
+            [
+                "gemini-3.7-flash-thinking",
+                "gemini-3.6-flash-thinking",
+                "gemini-3.5-flash-thinking",
+            ],
+        )
+        self.assertTrue(all(attempt[2] == 0 for attempt in attempts))
+
+    def test_round_robin_rotates_first_model_and_keeps_fallbacks(self):
+        self.assertIn("gemini-balanced-test", _model_catalog())
+        orders = []
+        for _ in range(3):
+            _, attempts, error = resolve_model_chain("gemini-balanced-test")
+            self.assertIsNone(error)
+            orders.append([attempt[0] for attempt in attempts])
+        self.assertEqual(orders, [
+            ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"],
+            ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.7-flash"],
+            ["gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.6-flash"],
+        ])
+
+    def test_named_combo_rejects_nested_combo(self):
+        CONFIG["model_combos"]["gemini-nested"] = ["gemini-deep"]
+        _, attempts, error = resolve_model_chain("gemini-nested")
+        self.assertEqual(attempts, [])
+        self.assertIn("Invalid combo model", error)
+
+    def test_named_combo_rejects_unknown_strategy(self):
+        CONFIG["model_combos"]["gemini-invalid"] = {
+            "strategy": "random",
+            "models": ["gemini-3.7-flash"],
+        }
+        _, attempts, error = resolve_model_chain("gemini-invalid")
+        self.assertEqual(attempts, [])
+        self.assertIn("Invalid combo strategy", error)
+
+    @mock.patch("gemini_web2api.server.log")
+    @mock.patch("gemini_web2api.server.generate")
+    def test_combo_falls_back_on_error_and_empty_response(self, generate, log):
+        generate.side_effect = [RuntimeError("denied"), ""]
+        _, attempts, _ = resolve_model_chain("gemini-combo")
+        with self.assertRaisesRegex(RuntimeError, "all combo models failed"):
+            _generate_attempts("hello", attempts, None, True)
+        self.assertEqual(generate.call_count, 2)
+        self.assertEqual(log.call_args_list, [
+            mock.call("Model gemini-3.1-pro: calling"),
+            mock.call("Model gemini-3.1-pro: failed (denied)"),
+            mock.call("Model gemini-3.7-flash: calling"),
+            mock.call("Model gemini-3.7-flash: failed (empty response)"),
+        ])
+
+    @mock.patch("gemini_web2api.server.log")
+    @mock.patch("gemini_web2api.server.generate")
+    def test_combo_returns_first_successful_response(self, generate, log):
+        generate.side_effect = [RuntimeError("denied"), "fallback ok"]
+        _, attempts, _ = resolve_model_chain("gemini-combo")
+        self.assertEqual(_generate_attempts("hello", attempts, None, True), "fallback ok")
+        self.assertEqual(generate.call_count, 2)
+        self.assertEqual(log.call_args_list[-2:], [
+            mock.call("Model gemini-3.7-flash: calling"),
+            mock.call("Model gemini-3.7-flash: success"),
+        ])
+
+    @mock.patch("gemini_web2api.server.generate_stream")
+    def test_combo_stream_does_not_switch_after_output(self, generate_stream):
+        def partial_failure():
+            yield "partial"
+            raise RuntimeError("stream broke")
+
+        generate_stream.side_effect = [partial_failure(), iter(["must not run"])]
+        _, attempts, _ = resolve_model_chain("gemini-combo")
+        stream = _generate_stream_attempts("hello", attempts, None, True)
+        self.assertEqual(next(stream), "partial")
+        with self.assertRaisesRegex(RuntimeError, "stream broke"):
+            next(stream)
+        self.assertEqual(generate_stream.call_count, 1)
+
+
+class ConversationInputTests(unittest.TestCase):
+    def tearDown(self):
+        import gemini_web2api.server as server_module
+        server_module._chat_history = []
+        reset_conversation()
+
+    @mock.patch("gemini_web2api.server.reset_conversation")
+    def test_incremental_messages_send_only_new_user_turn(self, reset):
+        first = [
+            {"role": "system", "content": "instructions"},
+            {"role": "user", "content": "first"},
+        ]
+        second = first + [
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "follow up"},
+        ]
+
+        self.assertEqual(_incremental_chat_messages(first), first)
+        _commit_chat_messages(first)
+        self.assertEqual(
+            _incremental_chat_messages(second),
+            [{"role": "user", "content": "follow up"}],
+        )
+        reset.assert_not_called()
+
+    @mock.patch("gemini_web2api.server.reset_conversation")
+    def test_shorter_history_resets_upstream_conversation(self, reset):
+        old = [{"role": "user", "content": "old"}]
+        _incremental_chat_messages(old)
+        _commit_chat_messages(old)
+
+        fresh = [{"role": "user", "content": "new"}]
+        self.assertEqual(_incremental_chat_messages(fresh), fresh)
+
+        reset.assert_called_once()
+
+
 class StreamingEndpointTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -156,8 +688,20 @@ class StreamingEndpointTests(unittest.TestCase):
         self.original_config = dict(CONFIG)
         CONFIG["api_keys"] = []
         CONFIG["log_requests"] = False
+        import gemini_web2api.server as server_module
+        server_module._chat_history = []
+        reset_conversation()
+        self.refresh_auth_patcher = mock.patch(
+            "gemini_web2api.server.refresh_auth",
+            return_value={"cookie": "fake authenticated cookie"},
+        )
+        self.refresh_auth = self.refresh_auth_patcher.start()
 
     def tearDown(self):
+        self.refresh_auth_patcher.stop()
+        import gemini_web2api.server as server_module
+        server_module._chat_history = []
+        reset_conversation()
         CONFIG.clear()
         CONFIG.update(self.original_config)
 
@@ -170,10 +714,16 @@ class StreamingEndpointTests(unittest.TestCase):
             headers={"Content-Type": "application/json"},
         )
         response = connection.getresponse()
-        body = response.read().decode()
         headers = dict(response.getheaders())
+        chunks = []
+        try:
+            while chunk := response.read1(65536):
+                chunks.append(chunk)
+        except ConnectionResetError:
+            if headers.get("Content-Type") != "text/event-stream":
+                raise
         connection.close()
-        return response.status, headers, body
+        return response.status, headers, b"".join(chunks).decode()
 
     def post_chunked_json(self, path, payload):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
@@ -189,6 +739,21 @@ class StreamingEndpointTests(unittest.TestCase):
         headers = dict(response.getheaders())
         connection.close()
         return response.status, headers, body
+
+    def test_chat_requires_model(self):
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "hello"}]},
+        )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body)["error"]["message"], "model is required")
+
+    def test_responses_requires_model(self):
+        status, _, body = self.post_json("/v1/responses", {"input": "hello"})
+
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body)["error"]["message"], "model is required")
 
     @mock.patch("gemini_web2api.server.generate_stream")
     def test_chat_stream_starts_with_assistant_role(self, generate_stream):
@@ -254,9 +819,90 @@ class StreamingEndpointTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         upload_image.assert_called_once_with(b"fake png", "image.png", "image/png")
-        self.assertEqual(generate.call_args.args[3], ["/uploaded/image-ref"])
+        self.assertEqual(generate.call_args.args[3], [("/uploaded/image-ref", "image.png")])
         self.assertIn("[Image attached]", generate.call_args.args[0])
         self.assertEqual(json.loads(body)["choices"][0]["message"]["content"], "looks good")
+
+    @mock.patch("gemini_web2api.server.upload_image")
+    @mock.patch("gemini_web2api.server.generate")
+    def test_chat_rejects_anonymous_image_before_upload(self, generate, upload_image):
+        self.refresh_auth.return_value = {"cookie": ""}
+        image_data = base64.b64encode(b"same image").decode()
+
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe it"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_data}"}},
+                    ],
+                }],
+            },
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn("requires authenticated Gemini cookies", json.loads(body)["error"]["message"])
+        upload_image.assert_not_called()
+        generate.assert_not_called()
+
+    @mock.patch("gemini_web2api.server.upload_image", return_value="/uploaded/unique-ref")
+    @mock.patch("gemini_web2api.server.generate", return_value="deduplicated")
+    def test_chat_uploads_only_latest_history_image(self, generate, upload_image):
+        old_image_data = base64.b64encode(b"old image").decode()
+        new_image_data = base64.b64encode(b"new image").decode()
+        old_image_part = {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{old_image_data}"},
+        }
+        new_image_part = {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{new_image_data}"},
+        }
+
+        status, _, _ = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "First"}, old_image_part]},
+                    {"role": "assistant", "content": "Earlier answer"},
+                    {"role": "user", "content": [{"type": "text", "text": "Again"}, new_image_part]},
+                ],
+            },
+        )
+
+        self.assertEqual(status, 200)
+        upload_image.assert_called_once_with(b"new image", "image.png", "image/png")
+        self.assertEqual(generate.call_args.args[3], [("/uploaded/unique-ref", "image.png")])
+
+    @mock.patch("gemini_web2api.server.upload_image", return_value="/uploaded/image-ref")
+    @mock.patch("gemini_web2api.server.generate", side_effect=GeminiUpstreamError(1100))
+    def test_chat_reports_expired_image_session_as_auth_error(self, generate, upload_image):
+        image_data = base64.b64encode(b"fake png").decode()
+
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe it"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_data}"}},
+                    ],
+                }],
+            },
+        )
+
+        self.assertEqual(status, 401)
+        message = json.loads(body)["error"]["message"]
+        self.assertIn("expired or unauthenticated", message)
+        self.assertIn("export a new gemini-auth.json", message)
+        upload_image.assert_called_once()
+        generate.assert_called_once()
 
     @mock.patch("gemini_web2api.server.fetch_image_bytes", return_value=b"\xff\xd8\xffremote jpeg")
     @mock.patch("gemini_web2api.server.upload_image", return_value="/uploaded/remote-ref")
@@ -282,7 +928,7 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(status, 200)
         fetch_image_bytes.assert_called_once_with("https://example.com/image.jpg")
         upload_image.assert_called_once_with(b"\xff\xd8\xffremote jpeg", "image.png", "image/jpeg")
-        self.assertEqual(generate.call_args.args[3], ["/uploaded/remote-ref"])
+        self.assertEqual(generate.call_args.args[3], [("/uploaded/remote-ref", "image.png")])
         self.assertIn("[Image attached]", generate.call_args.args[0])
 
     @mock.patch("gemini_web2api.server.upload_image", return_value="/uploaded/image-ref")
@@ -306,7 +952,7 @@ class StreamingEndpointTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         upload_image.assert_called_once_with(b"fake png", "image.png", "image/png")
-        self.assertEqual(generate.call_args.args[3], ["/uploaded/image-ref"])
+        self.assertEqual(generate.call_args.args[3], [("/uploaded/image-ref", "image.png")])
         self.assertIn("What is shown?", generate.call_args.args[0])
         self.assertIn("[Image attached]", generate.call_args.args[0])
 

@@ -30,6 +30,48 @@ python gemini_web2api.py
 
 Server starts at `http://localhost:8081/v1`.
 
+### Build a portable Windows executable
+
+Run the build on Windows; PyInstaller executables are specific to the OS that builds them. Python 3.8 or newer is required for the build only.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-windows-exe.ps1
+```
+
+The script creates an isolated `.venv-build`, installs the streaming dependency and PyInstaller, runs the test suite, and writes two tray executables:
+
+```text
+dist\gemini-web2api.exe
+dist\gemini-web2api-cookie.exe
+```
+
+Run them without Python or a virtual environment. They start without a console window and remain available from the Windows notification area. Double-click the tray icon to open `/v1/models`; right-click it to see the live **Auth: Cookie loaded** or **Auth: Anonymous** status and actions for **Open API**, **Copy endpoint**, **Open config.json**, **Restart app**, and **Exit**. The status refreshes whenever the menu opens, so auth-file hot reloads are reflected immediately. **Copy endpoint** copies `http://localhost:8081/v1` using the active port. **Restart app** cleanly stops the HTTP server and replaces the current process, which can recover it after sleep or hibernation. Use **Exit** to stop the HTTP server cleanly:
+
+```powershell
+.\dist\gemini-web2api.exe
+.\dist\gemini-web2api.exe --port 8082
+.\dist\gemini-web2api.exe --config .\config.json --cookie-file .\gemini-auth.json
+```
+
+On first start, both executables create `config.json` beside themselves if it is missing. `gemini-web2api-cookie.exe` also creates an empty `gemini-auth.json` template. Existing files are never overwritten. The cookie executable then automatically loads both sibling files:
+
+```text
+dist\
+  gemini-web2api-cookie.exe
+  config.json
+  gemini-auth.json
+```
+
+```powershell
+.\dist\gemini-web2api-cookie.exe
+```
+
+The generated auth template has an empty `cookie`; this is valid and runs anonymously until replaced by an extension export. Exporting a newer `gemini-auth.json` over the running file hot-reloads cookies, `auth_user`, XSRF, and Gemini build metadata before the next request; restarting the EXE is unnecessary. Explicit `--config` and `--cookie-file` arguments override sibling files. A configured `cookie_file` takes precedence over sibling auth; when neither supplies credentials, the cookie EXE still accepts a sibling legacy `cookie.txt`.
+
+When running from Python without tray mode, startup prints `Cookie: yes (<path>)` only after valid auth data is loaded, `Cookie: error (<path>): <reason>` for invalid auth JSON, `Cookie: missing (<path>)` for a configured missing path, `Cookie: none (anonymous; empty template: <path>)` for the generated empty template, or `Cookie: none (anonymous)` when no path is configured.
+
+Keep `config.json` and auth files external to the executables so they can be changed without rebuilding. Never distribute the auth file with the executable. The build environment and generated `build`/`dist` directories are ignored by Git.
+
 ## Client Configuration
 
 ### Cherry Studio / ChatBox / any OpenAI client
@@ -108,52 +150,27 @@ gemini-3.5-flash-thinking@think=4   # shallowest
 
 ## Optional: Cookie for Pro
 
-Anonymous access works for all models, but `gemini-3.1-pro` routes to Flash without authentication. To get real Pro routing, you need a **Gemini Advanced (paid subscription)** account cookie:
+Anonymous access works for all models, but `gemini-3.1-pro` routes to Flash without authentication. To get real Pro routing, you need a **Gemini Advanced (paid subscription)** account session.
+
+### Recommended: Gemini Cookie Sync extension
+
+1. Open `chrome://extensions`, enable Developer mode, and click **Load unpacked**. Click **Reload** there after updating an already-loaded extension.
+2. Select the `gemini-cookie-sync-extension` folder.
+3. Open `https://gemini.google.com/app`, sign in, and refresh the page.
+4. Open the extension, click **Inspect session**, then **Export gemini-auth.json**.
+5. The extension downloads exactly `gemini-auth.json` and overwrites the previous download instead of using a blob UUID. Move it beside `gemini-web2api-cookie.exe`; the running EXE hot-reloads it.
+
+The extension exports the cookie string, `SAPISID`, account index, XSRF token, and current Gemini build identifier. The server validates and hot-reloads this file when it changes. If a replacement is briefly incomplete or invalid, active requests continue using the last valid snapshot.
+
+Precedence is: explicit CLI path > sibling `gemini-auth.json` > `cookie_file` from `config.json` > anonymous/default configuration. Auth metadata present in `gemini-auth.json` overrides matching `auth_user`, `xsrf_token`, and `gemini_bl` values from `config.json`; missing metadata falls back to config.
+
+Manual `cookie.txt` and JSON files containing at least `cookie` plus optional `sapisid` remain supported:
 
 ```bash
-python gemini_web2api.py --cookie-file cookie.txt
+python gemini_web2api.py --cookie-file gemini-auth.json
 ```
 
-### How to get cookies
-
-1. Open Chrome, go to [gemini.google.com](https://gemini.google.com) and sign in with a **Gemini Advanced** Google account
-2. Open DevTools (F12) → Application → Cookies → `https://gemini.google.com`
-3. Copy these cookie values: `SID`, `HSID`, `SSID`, `APISID`, `SAPISID`, `__Secure-1PSID`
-4. Create `cookie.txt` in this format:
-
-```
-SID=your_sid_value; HSID=your_hsid_value; SSID=your_ssid_value; APISID=your_apisid_value; SAPISID=your_sapisid_value; __Secure-1PSID=your_1psid_value
-```
-
-Or use the JSON format:
-```json
-{"cookie": "SID=xxx; HSID=xxx; SSID=xxx; APISID=xxx; SAPISID=xxx; __Secure-1PSID=xxx", "sapisid": "your_sapisid_value"}
-```
-
-**Alternative (browser extension)**: Use any "Export Cookies" extension to export cookies for `gemini.google.com` in Netscape format, then convert to the single-line format above.
-
-### Authenticated account path and XSRF token
-
-If the signed-in Gemini page URL contains an account index, such as:
-
-```
-https://gemini.google.com/u/1/app/...
-```
-
-set `auth_user` to that index. Authenticated web requests may also require the page XSRF token. In the rendered Gemini page source, this token is exposed as `SNlM0e`; pass it as `xsrf_token` in `config.json`. The server sends it as the `at` form field.
-
-Example:
-
-```json
-{
-  "cookie_file": "/app/cookie.txt",
-  "auth_user": "1",
-  "xsrf_token": "AOOh0P...",
-  "gemini_bl": "boq_assistant-bard-web-server_YYYYMMDD.xx_p0"
-}
-```
-
-If authenticated requests return HTTP 400 with an `xsrf` error, refresh Gemini Web, update `xsrf_token`, and make sure `auth_user` matches the `/u/<index>/` part of the browser URL.
+If authenticated requests return HTTP 400 with an XSRF error, refresh Gemini Web and export `gemini-auth.json` again.
 
 Pro routing requires **Gemini Advanced** (paid subscription). A free Google account cookie will authenticate but silently fall back to Flash.
 
@@ -171,6 +188,25 @@ Create `config.json` in the same directory:
   "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
   "auth_user": null,
   "xsrf_token": null,
+  "model_combos": {
+    "gemini-combo": {
+      "strategy": "fallback",
+      "models": [
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-thinking",
+        "gemini-3.5-flash-thinking-lite"
+      ]
+    },
+    "gemini-deep": {
+      "strategy": "round_robin",
+      "models": [
+        "gemini-3.7-flash-thinking@think=0",
+        "gemini-3.6-flash-thinking@think=0",
+        "gemini-3.5-flash-thinking@think=0"
+      ]
+    }
+  },
   "api_keys": ["sk-your-key"],
   "cookie_file": null,
   "proxy": null,
@@ -181,6 +217,8 @@ Create `config.json` in the same directory:
 
 Set `temporary_chats` to `true` to use Gemini Web temporary chats instead of
 persisting conversations to the account history.
+
+Each `model_combos` key becomes a virtual model exposed by `/v1/models`; clients can request `gemini-combo`, `gemini-deep`, or any other configured name. `fallback` starts every request at the first model. `round_robin` rotates the first model per request, then uses the remaining models as fallbacks. Rotation is in memory and resets when the process restarts. An array value is shorthand for `fallback`. OpenAI-compatible Chat Completions and Responses requests must include a non-empty `model`; missing models return HTTP 400. Models fall back after an upstream error or empty response. `@think=N` overrides the thinking level for that attempt. Streaming falls back only before any content is emitted, preventing mixed model output. Combo nesting, invalid strategies, and invalid model names reject the request.
 
 When `api_keys` is `[]`, authentication is disabled. When one or more keys are set, `/v1/*` endpoints require `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
@@ -270,7 +308,7 @@ resp = client.chat.completions.create(
 
 - **Image upload may require cookies**: Multimodal input uses Gemini Web's image upload endpoint. If anonymous upload fails, configure a Gemini cookie.
 - **Not real Pro/Ultra**: Without a paid subscription cookie, `gemini-3.1-pro` routes to the same Flash model. The "Pro" label is a UI preference, not a backend model switch.
-- **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
+- **One active conversation**: Sequential overlay requests reuse one Gemini Web conversation. Clearing or replacing the overlay message history resets the upstream conversation. Run separate server instances on separate ports for concurrent independent overlays.
 - **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.
 
 ## Requirements

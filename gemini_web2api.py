@@ -56,7 +56,6 @@ DEFAULT_CONFIG = {
     "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
     "auth_user": None,
     "xsrf_token": None,
-    "default_model": "gemini-3.6-flash",
     "log_requests": True,
     "cookie_file": None,
     "proxy": None,
@@ -772,8 +771,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def handle_chat(self, body: bytes):
         req = json.loads(body)
-        model_name, model_id, think_mode, err = self._resolve_model(
-            req.get("model", CONFIG["default_model"]))
+        requested_model = req.get("model")
+        if not isinstance(requested_model, str) or not requested_model:
+            self.send_json({"error": {"message": "model is required"}}, 400)
+            return
+        model_name, model_id, think_mode, err = self._resolve_model(requested_model)
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
@@ -856,8 +858,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
     def handle_responses(self, body: bytes):
         """OpenAI Responses API for Codex CLI compatibility."""
         req = json.loads(body)
-        model_name, model_id, think_mode, err = self._resolve_model(
-            req.get("model", CONFIG["default_model"]))
+        requested_model = req.get("model")
+        if not isinstance(requested_model, str) or not requested_model:
+            self.send_json({"error": {"message": "model is required"}}, 400)
+            return
+        model_name, model_id, think_mode, err = self._resolve_model(requested_model)
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return

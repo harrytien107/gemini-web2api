@@ -7,7 +7,25 @@
   "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
   "auth_user": null,
   "xsrf_token": null,
-  "default_model": "gemini-3.6-flash",
+  "model_combos": {
+    "gemini-combo": {
+      "strategy": "fallback",
+      "models": [
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-thinking",
+        "gemini-3.5-flash-thinking-lite"
+      ]
+    },
+    "gemini-deep": {
+      "strategy": "round_robin",
+      "models": [
+        "gemini-3.7-flash-thinking@think=0",
+        "gemini-3.6-flash-thinking@think=0",
+        "gemini-3.5-flash-thinking@think=0"
+      ]
+    }
+  },
   "api_keys": [
     "sk-gemini"
   ],

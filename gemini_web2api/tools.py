@@ -129,7 +129,12 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
                 f"{constraint}"
             )
 
-    for msg in messages:
+    latest_user_index = next(
+        (index for index in range(len(messages) - 1, -1, -1)
+         if isinstance(messages[index], dict) and messages[index].get("role", "user") == "user"),
+        -1,
+    )
+    for index, msg in enumerate(messages):
         role = msg.get("role", "user")
         content = msg.get("content", "")
 
@@ -141,8 +146,11 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
                 else:
                     image = _image_from_part(c)
                     if image:
-                        images.append(image)
-                        text_parts.append("[Image attached]")
+                        if index == latest_user_index:
+                            images.append(image)
+                            text_parts.append("[Image attached]")
+                        else:
+                            text_parts.append("[Earlier image omitted]")
             content = " ".join(text_parts)
 
         if role == "system":
