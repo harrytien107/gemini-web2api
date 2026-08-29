@@ -581,6 +581,19 @@ def _extract_upstream_error_code(raw: str):
     return None
 
 
+def _log_upstream_rejection(error, raw: str, auth: dict, conversation_id: str,
+                            prompt: str, file_refs: list) -> None:
+    metadata = _conversation_metadata(auth, conversation_id)
+    log(
+        "Gemini rejection diagnostics: "
+        f"code={error.code} conversation={conversation_id or _DEFAULT_CONVERSATION_ID} "
+        f"upstream_thread={'yes' if all(metadata[:3]) else 'no'} "
+        f"prompt_chars={len(prompt)} attachments={len(file_refs or [])} "
+        f"auth={'authenticated' if auth.get('cookie') else 'anonymous'} "
+        f"response={_response_shape(raw)}"
+    )
+
+
 def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
     if error_code := _extract_upstream_error_code(raw):
@@ -652,6 +665,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     proxy = CONFIG.get("proxy")
 
     last_err = None
+    raw = ""
     for attempt in range(CONFIG["retry_attempts"]):
         try:
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
@@ -673,6 +687,9 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
         except Exception as e:
             last_err = e
             if isinstance(e, GeminiUpstreamError):
+                _log_upstream_rejection(
+                    e, raw, auth, conversation_id, prompt, file_refs,
+                )
                 break
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
@@ -700,6 +717,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
 
     last_err = None
     emitted_raw_text = ""
+    rejection_raw = ""
     for attempt in range(CONFIG["retry_attempts"]):
         try:
             attempt_emitted = False
@@ -708,6 +726,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 buf = ""
                 for chunk in resp.iter_text():
                     buf += chunk
+                    rejection_raw = buf
                     if "BardErrorInfo" in buf:
                         bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
                         if bard_err:
@@ -745,6 +764,9 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         except Exception as e:
             last_err = e
             if isinstance(e, GeminiUpstreamError):
+                _log_upstream_rejection(
+                    e, rejection_raw, auth, conversation_id, prompt, file_refs,
+                )
                 break
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")

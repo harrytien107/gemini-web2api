@@ -20,6 +20,7 @@ from gemini_web2api.gemini import (
     create_conversation,
     extract_response_text,
     generate,
+    generate_stream,
     refresh_auth,
     reset_conversation,
 )
@@ -195,17 +196,43 @@ class AuthReloadTests(unittest.TestCase):
         self.assertEqual(generate("test", 1, 4), "API_TEST_OK")
         self.assertEqual(urlopen.call_count, 2)
 
+    @mock.patch("gemini_web2api.gemini.log")
     @mock.patch("gemini_web2api.gemini.urllib.request.urlopen")
-    def test_generate_does_not_retry_terminal_upstream_rejection(self, urlopen):
+    def test_generate_does_not_retry_terminal_upstream_rejection(self, urlopen, log):
         CONFIG["retry_attempts"] = 3
         rejected = mock.Mock()
         rejected.read.return_value = b"BardErrorInfo [1100]"
         urlopen.return_value = rejected
 
         with self.assertRaisesRegex(GeminiUpstreamError, "error 1100"):
-            generate("test", 1, 4)
+            generate("secret prompt", 1, 4)
 
         urlopen.assert_called_once()
+        diagnostic = log.call_args.args[0]
+        self.assertIn("code=1100", diagnostic)
+        self.assertIn("prompt_chars=13", diagnostic)
+        self.assertIn("upstream_thread=no", diagnostic)
+        self.assertNotIn("secret prompt", diagnostic)
+
+
+    @mock.patch("gemini_web2api.gemini.HAS_HTTPX", True)
+    @mock.patch("gemini_web2api.gemini.log")
+    @mock.patch("gemini_web2api.gemini._get_httpx_client")
+    def test_generate_stream_logs_redacted_rejection_diagnostics(self, get_client, log):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.iter_text.return_value = iter(["BardErrorInfo [1096]"])
+        get_client.return_value.stream.return_value = response
+
+        with self.assertRaisesRegex(GeminiUpstreamError, "error 1096"):
+            list(generate_stream("private stream prompt", 1, 4, ["image-ref"]))
+
+        diagnostic = log.call_args.args[0]
+        self.assertIn("code=1096", diagnostic)
+        self.assertIn("prompt_chars=21", diagnostic)
+        self.assertIn("attachments=1", diagnostic)
+        self.assertNotIn("private stream prompt", diagnostic)
+        self.assertNotIn("image-ref", diagnostic)
 
 
 class MultimodalAuthTests(unittest.TestCase):
