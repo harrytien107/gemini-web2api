@@ -1,5 +1,4 @@
 import http.client
-import subprocess
 import base64
 import json
 import os
@@ -17,6 +16,8 @@ from gemini_web2api.gemini import (
     _get_url,
     GeminiUpstreamError,
     auth_status,
+    conversation_info,
+    create_conversation,
     extract_response_text,
     generate,
     refresh_auth,
@@ -35,7 +36,6 @@ from gemini_web2api.server import (
     _model_catalog,
 )
 from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt
-from gemini_web2api.tray import _restart_app, _restart_command
 
 
 def _decode_payload(payload):
@@ -327,31 +327,6 @@ class FileLoggingTests(unittest.TestCase):
                 content = file.read()
 
         self.assertIn("Model gemini-3.7-flash: success", content)
-
-
-class TrayTests(unittest.TestCase):
-    @mock.patch("gemini_web2api.tray.sys")
-    def test_restart_command_preserves_args_without_duplicate_tray(self, tray_sys):
-        tray_sys.argv = ["app.exe", "--tray", "--port", "8082"]
-        tray_sys.executable = "app.exe"
-        tray_sys.frozen = True
-
-        self.assertEqual(_restart_command(), ["app.exe", "--port", "8082"])
-
-    @mock.patch("gemini_web2api.tray.subprocess.Popen")
-    @mock.patch("gemini_web2api.tray.sys")
-    def test_restart_app_spawns_detached_frozen_executable(self, tray_sys, popen):
-        tray_sys.argv = ["app.exe", "--tray", "--port", "8082"]
-        tray_sys.executable = "app.exe"
-        tray_sys.frozen = True
-        tray_sys.platform = "win32"
-
-        _restart_app()
-
-        popen.assert_called_once_with(
-            ["app.exe", "--port", "8082"],
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
-        )
 
 
 class PayloadPersistenceTests(unittest.TestCase):
@@ -669,6 +644,27 @@ class ConversationInputTests(unittest.TestCase):
 
         reset.assert_called_once()
 
+    @mock.patch("gemini_web2api.server.reset_conversation")
+    def test_explicit_session_rebuilt_history_sends_only_latest_turn(self, reset):
+        old = [
+            {"role": "system", "content": "old system"},
+            {"role": "user", "content": "old question"},
+            {"role": "assistant", "content": "old answer"},
+        ]
+        rebuilt = [
+            {"role": "system", "content": "new model system"},
+            {"role": "user", "content": "old question"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "new question"},
+        ]
+        _commit_chat_messages(old, "selected-chat")
+
+        self.assertEqual(
+            _incremental_chat_messages(rebuilt, "selected-chat"),
+            [{"role": "user", "content": "new question"}],
+        )
+        reset.assert_not_called()
+
 
 class StreamingEndpointTests(unittest.TestCase):
     @classmethod
@@ -686,10 +682,15 @@ class StreamingEndpointTests(unittest.TestCase):
 
     def setUp(self):
         self.original_config = dict(CONFIG)
+        self.conversation_dir = tempfile.TemporaryDirectory()
         CONFIG["api_keys"] = []
         CONFIG["log_requests"] = False
+        CONFIG["conversation_store_file"] = os.path.join(
+            self.conversation_dir.name, "conversations.json"
+        )
         import gemini_web2api.server as server_module
         server_module._chat_history = []
+        server_module._chat_histories.clear()
         reset_conversation()
         self.refresh_auth_patcher = mock.patch(
             "gemini_web2api.server.refresh_auth",
@@ -701,17 +702,21 @@ class StreamingEndpointTests(unittest.TestCase):
         self.refresh_auth_patcher.stop()
         import gemini_web2api.server as server_module
         server_module._chat_history = []
+        server_module._chat_histories.clear()
         reset_conversation()
         CONFIG.clear()
         CONFIG.update(self.original_config)
+        self.conversation_dir.cleanup()
 
-    def post_json(self, path, payload):
+    def post_json(self, path, payload, headers=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        request_headers = {"Content-Type": "application/json"}
+        request_headers.update(headers or {})
         connection.request(
             "POST",
             path,
             body=json.dumps(payload),
-            headers={"Content-Type": "application/json"},
+            headers=request_headers,
         )
         response = connection.getresponse()
         headers = dict(response.getheaders())
@@ -739,6 +744,29 @@ class StreamingEndpointTests(unittest.TestCase):
         headers = dict(response.getheaders())
         connection.close()
         return response.status, headers, body
+
+    def get_json(self, path):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request("GET", path)
+        response = connection.getresponse()
+        body = response.read().decode()
+        headers = dict(response.getheaders())
+        connection.close()
+        return response.status, headers, body
+
+    def test_browser_conversation_manager_supports_empty_api_keys(self):
+        status, headers, body = self.get_json("/conversations")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/html; charset=utf-8")
+        self.assertIn("Gemini Conversations", body)
+        self.assertIn("leave empty when api_keys is []", body)
+
+        status, _, body = self.post_json(
+            "/v1/conversations", {"id": "browser-created"}
+        )
+        self.assertEqual(status, 201)
+        self.assertTrue(json.loads(body)["active"])
 
     def test_chat_requires_model(self):
         status, _, body = self.post_json(
@@ -792,6 +820,126 @@ class StreamingEndpointTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["choices"][0]["message"]["content"], "chunked ok")
+
+    @mock.patch("gemini_web2api.server.reset_conversation")
+    @mock.patch("gemini_web2api.server.generate", return_value="continued")
+    def test_explicit_conversation_survives_model_and_history_change(self, generate, reset):
+        headers = {"X-Conversation-ID": "overlay-chat-1"}
+        first = {
+            "model": "gemini-3.6-flash",
+            "messages": [{"role": "user", "content": "first"}],
+        }
+        changed = {
+            "model": "gemini-auto",
+            "messages": [{"role": "user", "content": "model changed"}],
+        }
+
+        first_status, first_headers, _ = self.post_json(
+            "/v1/chat/completions", first, headers
+        )
+        second_status, second_headers, body = self.post_json(
+            "/v1/chat/completions", changed, headers
+        )
+
+        self.assertEqual((first_status, second_status), (200, 200))
+        self.assertEqual(first_headers["X-Conversation-ID"], "overlay-chat-1")
+        self.assertEqual(second_headers["X-Conversation-ID"], "overlay-chat-1")
+        self.assertEqual(json.loads(body)["conversation_id"], "overlay-chat-1")
+        self.assertEqual([call.args[5] for call in generate.call_args_list], [
+            "overlay-chat-1", "overlay-chat-1",
+        ])
+        reset.assert_not_called()
+
+    @mock.patch("gemini_web2api.server.generate", return_value="active session")
+    def test_selected_conversation_applies_without_custom_client_headers(self, generate):
+        status, _, body = self.post_json(
+            "/v1/conversations", {"id": "selected-chat"}
+        )
+        self.assertEqual(status, 201)
+        self.assertTrue(json.loads(body)["active"])
+
+        status, headers, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "ordinary overlay request"}],
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["X-Conversation-ID"], "selected-chat")
+        self.assertEqual(json.loads(body)["conversation_id"], "selected-chat")
+        self.assertEqual(generate.call_args.args[5], "selected-chat")
+
+    def test_conversation_attach_inspect_list_and_reset(self):
+        status, headers, body = self.post_json(
+            "/v1/conversations/site-chat/attach",
+            {"cid": "gemini-cid", "rid": "gemini-rid", "rcid": "gemini-rcid"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["X-Conversation-ID"], "site-chat")
+        self.assertEqual(json.loads(body)["cid"], "gemini-cid")
+
+        status, _, body = self.get_json("/v1/conversations/site-chat")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["metadata"][:3], [
+            "gemini-cid", "gemini-rid", "gemini-rcid",
+        ])
+        status, _, body = self.get_json("/v1/conversations")
+        self.assertEqual(status, 200)
+        self.assertEqual([item["id"] for item in json.loads(body)["data"]], ["site-chat"])
+
+        status, _, body = self.post_json("/v1/conversations/site-chat/reset", {})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["reset"])
+        status, _, _ = self.get_json("/v1/conversations/site-chat")
+        self.assertEqual(status, 404)
+
+    def test_existing_conversation_can_be_selected(self):
+        self.post_json("/v1/conversations", {"id": "first"})
+        self.post_json("/v1/conversations", {"id": "second"})
+
+        status, _, body = self.post_json("/v1/conversations/first/select", {})
+
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["active"])
+        self.assertEqual(gemini_module.active_conversation_id(), "first")
+
+    def test_conversation_metadata_persists_after_memory_reload(self):
+        auth = gemini_module.refresh_auth()
+        create_conversation("persisted", ["cid", "rid", "rcid"], auth)
+        self.assertTrue(os.path.isfile(CONFIG["conversation_store_file"]))
+
+        gemini_module._conversation_states.clear()
+        gemini_module._conversation_store_loaded = False
+
+        self.assertEqual(
+            conversation_info("persisted", auth)["metadata"][:3],
+            ["cid", "rid", "rcid"],
+        )
+
+    def test_conversation_ids_isolate_payload_metadata(self):
+        auth = gemini_module.refresh_auth()
+        create_conversation("one", ["cid-1", "rid-1", "rcid-1"], auth)
+        create_conversation("two", ["cid-2", "rid-2", "rcid-2"], auth)
+
+        one = _decode_payload(_build_payload(
+            "hello", 1, 4, auth=auth, conversation_id="one"
+        ))
+        two = _decode_payload(_build_payload(
+            "hello", 1, 4, auth=auth, conversation_id="two"
+        ))
+
+        self.assertEqual(one[2][:3], ["cid-1", "rid-1", "rcid-1"])
+        self.assertEqual(two[2][:3], ["cid-2", "rid-2", "rcid-2"])
+
+    def test_attach_rejects_partial_gemini_metadata(self):
+        status, _, body = self.post_json(
+            "/v1/conversations/broken/attach", {"cid": "only-cid"}
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn("cid, rid, and rcid", json.loads(body)["error"]["message"])
 
     @mock.patch("gemini_web2api.server.upload_image", return_value="/uploaded/image-ref")
     @mock.patch("gemini_web2api.server.generate", return_value="looks good")

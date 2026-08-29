@@ -25,8 +25,13 @@ _auth_lock = threading.RLock()
 _log_lock = threading.Lock()
 _runtime_metadata_lock = threading.Lock()
 _runtime_metadata = {"auth_key": None, "tokens": {}}
-_conversation_lock = threading.Lock()
-_conversation_state = {"auth_key": None, "metadata": ["", "", "", None, None, None, None, None, None, ""]}
+_conversation_lock = threading.RLock()
+_EMPTY_CONVERSATION_METADATA = ["", "", "", None, None, None, None, None, None, ""]
+_DEFAULT_CONVERSATION_ID = "__default__"
+_conversation_states = {}
+_active_conversation_id = None
+_conversation_store_path = None
+_conversation_store_loaded = False
 _auth_cache = {
     "path": None,
     "signature": None,
@@ -195,7 +200,7 @@ def make_sapisidhash(sapisid: str) -> str:
 def _auth_key(auth: dict) -> tuple:
     return (
         str(auth.get("auth_user") or ""),
-        hashlib.sha256(auth.get("cookie", "").encode()).digest(),
+        hashlib.sha256(auth.get("cookie", "").encode()).hexdigest(),
     )
 
 
@@ -244,27 +249,184 @@ def _build_headers(auth: dict = None, request_uuid: str = None) -> dict:
     return headers
 
 
-def reset_conversation() -> None:
+def _conversation_key(conversation_id: str = None) -> str:
+    return conversation_id or _DEFAULT_CONVERSATION_ID
+
+
+def _conversation_file() -> str:
+    configured = CONFIG.get("conversation_store_file")
+    if configured:
+        return os.path.abspath(configured)
+    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.getcwd()
+    return os.path.join(base, "gemini-conversations.json")
+
+
+def _load_conversation_store() -> None:
+    global _active_conversation_id, _conversation_store_loaded, _conversation_store_path
+    path = _conversation_file()
     with _conversation_lock:
-        _conversation_state.update({
-            "auth_key": None,
-            "metadata": ["", "", "", None, None, None, None, None, None, ""],
-        })
-    log("Gemini conversation reset")
+        if _conversation_store_loaded and _conversation_store_path == path:
+            return
+        _conversation_states.clear()
+        _active_conversation_id = None
+        _conversation_store_path = path
+        _conversation_store_loaded = True
+        try:
+            with open(path, encoding="utf-8") as file:
+                payload = json.load(file)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as error:
+            log(f"Conversation store load error: {error}")
+            return
+        conversations = payload.get("conversations", {}) if isinstance(payload, dict) else {}
+        active = payload.get("active_conversation_id") if isinstance(payload, dict) else None
+        _active_conversation_id = active if isinstance(active, str) else None
+        if not isinstance(conversations, dict):
+            return
+        for conversation_id, state in conversations.items():
+            if not isinstance(conversation_id, str) or not isinstance(state, dict):
+                continue
+            auth_key = state.get("auth_key")
+            metadata = state.get("metadata")
+            if (isinstance(auth_key, list) and len(auth_key) == 2
+                    and isinstance(metadata, list)):
+                _conversation_states[conversation_id] = {
+                    "auth_key": tuple(str(value) for value in auth_key),
+                    "metadata": list(metadata),
+                    "updated_at": int(state.get("updated_at") or 0),
+                }
 
 
-def _conversation_metadata(auth: dict) -> list:
+def _save_conversation_store() -> None:
+    path = _conversation_store_path or _conversation_file()
+    payload = {
+        "version": 1,
+        "active_conversation_id": _active_conversation_id,
+        "conversations": {
+            conversation_id: {
+                "auth_key": list(state["auth_key"]),
+                "metadata": state["metadata"],
+                "updated_at": state.get("updated_at", 0),
+            }
+            for conversation_id, state in _conversation_states.items()
+            if conversation_id != _DEFAULT_CONVERSATION_ID
+        },
+    }
+    directory = os.path.dirname(path)
+    temporary = path + ".tmp"
+    try:
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(temporary, "w", encoding="utf-8") as file:
+            json.dump(payload, file, indent=2)
+            file.write("\n")
+        os.replace(temporary, path)
+    except OSError as error:
+        log(f"Conversation store save error: {error}")
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+
+
+def create_conversation(conversation_id: str, metadata: list = None, auth: dict = None, select: bool = False) -> dict:
+    _load_conversation_store()
+    auth = auth or refresh_auth()
+    values = list(metadata or _EMPTY_CONVERSATION_METADATA)
+    if len(values) < len(_EMPTY_CONVERSATION_METADATA):
+        values.extend(_EMPTY_CONVERSATION_METADATA[len(values):])
+    global _active_conversation_id
+    with _conversation_lock:
+        _conversation_states[conversation_id] = {
+            "auth_key": _auth_key(auth),
+            "metadata": values,
+            "updated_at": int(time.time()),
+        }
+        if select:
+            _active_conversation_id = conversation_id
+        _save_conversation_store()
+    return conversation_info(conversation_id, auth)
+
+
+def conversation_info(conversation_id: str, auth: dict = None) -> dict:
+    _load_conversation_store()
+    auth = auth or refresh_auth()
+    with _conversation_lock:
+        state = _conversation_states.get(_conversation_key(conversation_id))
+        if not state or state["auth_key"] != _auth_key(auth):
+            return None
+        metadata = list(state["metadata"])
+        return {
+            "id": conversation_id,
+            "active": conversation_id == _active_conversation_id,
+            "metadata": metadata,
+            "cid": metadata[0] if metadata else "",
+            "rid": metadata[1] if len(metadata) > 1 else "",
+            "rcid": metadata[2] if len(metadata) > 2 else "",
+            "updated_at": state.get("updated_at", 0),
+        }
+
+
+def active_conversation_id() -> str:
+    _load_conversation_store()
+    with _conversation_lock:
+        return _active_conversation_id
+
+
+def select_conversation(conversation_id: str, auth: dict = None) -> dict:
+    global _active_conversation_id
+    info = conversation_info(conversation_id, auth)
+    if not info:
+        return None
+    with _conversation_lock:
+        _active_conversation_id = conversation_id
+        _save_conversation_store()
+    return conversation_info(conversation_id, auth)
+
+
+def list_conversations(auth: dict = None) -> list:
+    _load_conversation_store()
+    auth = auth or refresh_auth()
     key = _auth_key(auth)
     with _conversation_lock:
-        if _conversation_state["auth_key"] != key:
-            _conversation_state.update({
-                "auth_key": key,
-                "metadata": ["", "", "", None, None, None, None, None, None, ""],
-            })
-        return list(_conversation_state["metadata"])
+        ids = [
+            conversation_id for conversation_id, state in _conversation_states.items()
+            if conversation_id != _DEFAULT_CONVERSATION_ID and state["auth_key"] == key
+        ]
+    return [conversation_info(conversation_id, auth) for conversation_id in sorted(ids)]
 
 
-def _update_conversation_metadata(raw: str, auth: dict) -> None:
+def reset_conversation(conversation_id: str = None) -> None:
+    global _active_conversation_id
+    _load_conversation_store()
+    key = _conversation_key(conversation_id)
+    with _conversation_lock:
+        _conversation_states.pop(key, None)
+        if conversation_id:
+            if _active_conversation_id == conversation_id:
+                _active_conversation_id = None
+            _save_conversation_store()
+    log(f"Gemini conversation reset: {conversation_id or 'default'}")
+
+
+def _conversation_metadata(auth: dict, conversation_id: str = None) -> list:
+    _load_conversation_store()
+    key = _conversation_key(conversation_id)
+    auth_key = _auth_key(auth)
+    with _conversation_lock:
+        state = _conversation_states.get(key)
+        if not state or state["auth_key"] != auth_key:
+            state = {
+                "auth_key": auth_key,
+                "metadata": list(_EMPTY_CONVERSATION_METADATA),
+                "updated_at": int(time.time()),
+            }
+            _conversation_states[key] = state
+        return list(state["metadata"])
+
+
+def _update_conversation_metadata(raw: str, auth: dict, conversation_id: str = None) -> None:
     latest = None
     for line in raw.splitlines():
         if '"wrb.fr"' not in line:
@@ -278,8 +440,15 @@ def _update_conversation_metadata(raw: str, auth: dict) -> None:
         except (json.JSONDecodeError, IndexError, TypeError):
             continue
     if latest:
+        _load_conversation_store()
         with _conversation_lock:
-            _conversation_state.update({"auth_key": _auth_key(auth), "metadata": list(latest)})
+            _conversation_states[_conversation_key(conversation_id)] = {
+                "auth_key": _auth_key(auth),
+                "metadata": list(latest),
+                "updated_at": int(time.time()),
+            }
+            if conversation_id:
+                _save_conversation_store()
 
 
 def _apply_chat_persistence_flags(inner: list) -> None:
@@ -292,7 +461,7 @@ def _apply_chat_persistence_flags(inner: list) -> None:
         inner[41] = [2]
 
 
-def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, auth: dict = None, request_uuid: str = None) -> str:
+def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, auth: dict = None, request_uuid: str = None, conversation_id: str = None) -> str:
     inner = [None] * 81
     if file_refs:
         refs = []
@@ -307,7 +476,7 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
         inner[0] = [prompt, 0, None, None, None, None, 0]
     inner[1] = ["en"]
     auth = auth or refresh_auth()
-    inner[2] = _conversation_metadata(auth)
+    inner[2] = _conversation_metadata(auth, conversation_id)
     inner[4] = uuid.uuid4().hex
     inner[6] = [1]
     inner[7] = 1
@@ -469,12 +638,13 @@ def _response_shape(raw: str, limit: int = 120) -> str:
     )
 
 
-def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
+def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, conversation_id: str = None) -> str:
     """Non-streaming generation with retry."""
     auth = refresh_auth()
     request_uuid = str(uuid.uuid4()).upper()
     body = _build_payload(
-        prompt, model_id, think_mode, file_refs, extra_fields, auth, request_uuid
+        prompt, model_id, think_mode, file_refs, extra_fields, auth, request_uuid,
+        conversation_id,
     ).encode()
     url = _get_url(auth)
     headers = _build_headers(auth, request_uuid)
@@ -495,7 +665,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
             text = extract_response_text(raw)
-            _update_conversation_metadata(raw, auth)
+            _update_conversation_metadata(raw, auth, conversation_id)
             if not text:
                 log(f"Empty Gemini response structure: {_response_shape(raw)}")
                 raise RuntimeError("Gemini upstream returned an empty response")
@@ -510,10 +680,10 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     raise last_err
 
 
-def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
+def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, conversation_id: str = None):
     """Streaming generation via httpx with retry on connection failure."""
     if not HAS_HTTPX:
-        text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+        text = generate(prompt, model_id, think_mode, file_refs, extra_fields, conversation_id)
         if text:
             yield text
         return
@@ -521,7 +691,8 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
     auth = refresh_auth()
     request_uuid = str(uuid.uuid4()).upper()
     body = _build_payload(
-        prompt, model_id, think_mode, file_refs, extra_fields, auth, request_uuid
+        prompt, model_id, think_mode, file_refs, extra_fields, auth, request_uuid,
+        conversation_id,
     )
     url = _get_url(auth)
     headers = _build_headers(auth, request_uuid)
@@ -546,7 +717,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                         line, buf = buf.split("\n", 1)
                         lines.append(line)
                     for line in lines:
-                        _update_conversation_metadata(line, auth)
+                        _update_conversation_metadata(line, auth, conversation_id)
                         for t in _extract_texts_from_line(line):
                             if t == emitted_raw_text or emitted_raw_text.startswith(t):
                                 continue
@@ -557,7 +728,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             if delta:
                                 attempt_emitted = True
                                 yield delta
-                _update_conversation_metadata(buf, auth)
+                _update_conversation_metadata(buf, auth, conversation_id)
                 for t in _extract_texts_from_line(buf):
                     if t == emitted_raw_text or emitted_raw_text.startswith(t):
                         continue

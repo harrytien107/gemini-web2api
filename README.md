@@ -45,7 +45,7 @@ dist\gemini-web2api.exe
 dist\gemini-web2api-cookie.exe
 ```
 
-Run them without Python or a virtual environment. They start without a console window and remain available from the Windows notification area. Double-click the tray icon to open `/v1/models`; right-click it to see the live **Auth: Cookie loaded** or **Auth: Anonymous** status and actions for **Open API**, **Copy endpoint**, **Open config.json**, **Restart app**, and **Exit**. The status refreshes whenever the menu opens, so auth-file hot reloads are reflected immediately. **Copy endpoint** copies `http://localhost:8081/v1` using the active port. **Restart app** cleanly stops the HTTP server and replaces the current process, which can recover it after sleep or hibernation. Use **Exit** to stop the HTTP server cleanly:
+Run them without Python or a virtual environment. They start without a console window and remain available from the Windows notification area with the Gemini icon. Double-click the tray icon to open the conversation manager; right-click it to see the live **Auth: Cookie loaded** or **Auth: Anonymous** status and actions for **Manage conversations**, **Open API**, **Copy endpoint**, **Open config.json**, and **Exit**. The status refreshes whenever the menu opens, so auth-file hot reloads are reflected immediately. **Copy endpoint** copies `http://localhost:8081/v1` using the active port. Use **Exit** to stop the HTTP server cleanly:
 
 ```powershell
 .\dist\gemini-web2api.exe
@@ -125,6 +125,45 @@ Supports Google native API endpoints:
 - `GET /v1beta/models` — list models
 - `POST /v1beta/models/{model}:generateContent` — non-streaming
 - `POST /v1beta/models/{model}:streamGenerateContent` — streaming (SSE)
+
+## Persistent conversations
+
+For portable Windows builds, double-click the tray icon or right-click it and choose **Manage conversations**. The browser page creates, selects, lists, and resets sessions. If `api_keys` is `[]`, leave its API-key field empty. No command line is required.
+
+Create and select a conversation once, then use an ordinary OpenAI client without custom headers. The selected conversation remains active across model changes and executable restarts:
+
+```powershell
+curl.exe --% -X POST http://127.0.0.1:8081/v1/conversations -H "Content-Type: application/json" -H "Authorization: Bearer sk-your-key" -d "{\"id\":\"my-overlay-chat\"}"
+```
+
+Clients that support custom headers can select a conversation per request instead of changing the process-wide active conversation:
+
+```http
+X-Conversation-ID: my-overlay-chat
+```
+
+The JSON request field `conversation_id` is also accepted. Selection precedence is header, request field, then the process-wide active conversation.
+
+Conversation management endpoints:
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /v1/conversations` | Create and select a conversation. Body: `{"id":"my-chat"}`. Omit `id` to generate one. |
+| `GET /v1/conversations` | List saved conversations for the current Gemini account. |
+| `GET /v1/conversations/{id}` | Inspect saved Gemini metadata. |
+| `POST /v1/conversations/{id}/select` | Make a saved conversation the default for clients without custom headers. |
+| `POST /v1/conversations/{id}/reset` | Delete its metadata and clear it if selected. |
+| `POST /v1/conversations/{id}/attach` | Attach an existing Gemini Web chat using `cid`, `rid`, and `rcid`. |
+
+Attach an existing Gemini Web conversation after obtaining all three private metadata values:
+
+```powershell
+curl.exe --% -X POST http://127.0.0.1:8081/v1/conversations/site-chat/attach -H "Content-Type: application/json" -H "Authorization: Bearer sk-your-key" -d "{\"cid\":\"...\",\"rid\":\"...\",\"rcid\":\"...\"}"
+```
+
+The Gemini URL generally exposes only `cid`; continuing the latest branch reliably also requires `rid` and `rcid`. The adapter does not currently discover those two values from a URL. Conversations created through this API capture all three automatically.
+
+Named metadata is stored in `gemini-conversations.json` beside a portable executable. Set `conversation_store_file` to override that location. The store contains private Gemini conversation IDs and an account-session fingerprint, not raw cookies, but it should still remain private. A selected conversation deliberately survives rebuilt message history; use its reset endpoint when the overlay starts a genuinely new chat.
 
 ## Available Models
 
@@ -211,12 +250,13 @@ Create `config.json` in the same directory:
   "cookie_file": null,
   "proxy": null,
   "log_requests": true,
-  "temporary_chats": false
+  "temporary_chats": false,
+  "conversation_store_file": null
 }
 ```
 
 Set `temporary_chats` to `true` to use Gemini Web temporary chats instead of
-persisting conversations to the account history.
+persisting conversations to the account history. Named conversation selection is intended for persistent chats; temporary mode may cause Gemini to clear upstream context.
 
 Each `model_combos` key becomes a virtual model exposed by `/v1/models`; clients can request `gemini-combo`, `gemini-deep`, or any other configured name. `fallback` starts every request at the first model. `round_robin` rotates the first model per request, then uses the remaining models as fallbacks. Rotation is in memory and resets when the process restarts. An array value is shorthand for `fallback`. OpenAI-compatible Chat Completions and Responses requests must include a non-empty `model`; missing models return HTTP 400. Models fall back after an upstream error or empty response. `@think=N` overrides the thinking level for that attempt. Streaming falls back only before any content is emitted, preventing mixed model output. Combo nesting, invalid strategies, and invalid model names reject the request.
 

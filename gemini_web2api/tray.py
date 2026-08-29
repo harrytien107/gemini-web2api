@@ -1,8 +1,6 @@
 """Native Windows system tray host for the HTTP server."""
 import ctypes
 import os
-import subprocess
-import sys
 import threading
 import webbrowser
 from ctypes import wintypes
@@ -29,7 +27,7 @@ TPM_RETURNCMD = 0x0100
 OPEN_API = 1001
 OPEN_CONFIG = 1002
 COPY_ENDPOINT = 1003
-RESTART = 1005
+MANAGE_CONVERSATIONS = 1004
 EXIT = 1006
 TRAY_MESSAGE = WM_USER + 1
 CF_UNICODETEXT = 13
@@ -76,21 +74,6 @@ class WNDCLASSW(ctypes.Structure):
     ]
 
 
-def _restart_command() -> list:
-    args = [arg for arg in sys.argv[1:] if arg != "--tray"]
-    if getattr(sys, "frozen", False):
-        return [sys.executable, *args]
-    return [sys.executable, "-m", "gemini_web2api", "--tray", *args]
-
-
-def _restart_app() -> None:
-    command = _restart_command()
-    kwargs = {}
-    if sys.platform == "win32":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-    subprocess.Popen(command, **kwargs)
-
-
 def run_tray(server, config_path: str):
     """Run the server in a worker thread and own the Windows tray message loop."""
     user32 = ctypes.windll.user32
@@ -111,6 +94,7 @@ def run_tray(server, config_path: str):
     user32.DestroyWindow.argtypes = [wintypes.HWND]
     user32.SetForegroundWindow.argtypes = [wintypes.HWND]
     user32.DestroyMenu.argtypes = [wintypes.HMENU]
+    user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
     user32.LoadIconW.restype = wintypes.HICON
     user32.OpenClipboard.argtypes = [wintypes.HWND]
     user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
@@ -124,8 +108,8 @@ def run_tray(server, config_path: str):
     shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
     base_url = f"http://localhost:{server.server_address[1]}/v1"
     api_url = f"{base_url}/models"
+    conversations_url = f"http://localhost:{server.server_address[1]}/conversations"
     class_name = "GeminiWeb2ApiTray"
-    restart_requested = False
 
     def open_config():
         if config_path and os.path.isfile(config_path):
@@ -158,7 +142,6 @@ def run_tray(server, config_path: str):
             user32.CloseClipboard()
 
     def show_menu(hwnd):
-        nonlocal restart_requested
         status = auth_status()
         if status["loaded"] and status["error"]:
             auth_label = "Auth: Cookie loaded (last valid)"
@@ -172,11 +155,11 @@ def run_tray(server, config_path: str):
         try:
             user32.AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, auth_label)
             user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+            user32.AppendMenuW(menu, MF_STRING, MANAGE_CONVERSATIONS, "Manage conversations")
             user32.AppendMenuW(menu, MF_STRING, OPEN_API, "Open API")
             user32.AppendMenuW(menu, MF_STRING, COPY_ENDPOINT, "Copy endpoint")
             user32.AppendMenuW(menu, MF_STRING, OPEN_CONFIG, "Open config.json")
             user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-            user32.AppendMenuW(menu, MF_STRING, RESTART, "Restart app")
             user32.AppendMenuW(menu, MF_STRING, EXIT, "Exit")
             point = wintypes.POINT()
             user32.GetCursorPos(ctypes.byref(point))
@@ -185,15 +168,14 @@ def run_tray(server, config_path: str):
                 menu, TPM_RIGHTBUTTON | TPM_RETURNCMD,
                 point.x, point.y, 0, hwnd, None,
             )
-            if command == OPEN_API:
+            if command == MANAGE_CONVERSATIONS:
+                webbrowser.open(conversations_url)
+            elif command == OPEN_API:
                 webbrowser.open(api_url)
             elif command == COPY_ENDPOINT:
                 copy_endpoint(hwnd)
             elif command == OPEN_CONFIG:
                 open_config()
-            elif command == RESTART:
-                restart_requested = True
-                user32.PostQuitMessage(0)
             elif command == EXIT:
                 user32.PostQuitMessage(0)
         finally:
@@ -205,7 +187,7 @@ def run_tray(server, config_path: str):
             if lparam == WM_RBUTTONUP:
                 show_menu(hwnd)
             elif lparam == WM_LBUTTONDBLCLK:
-                webbrowser.open(api_url)
+                webbrowser.open(conversations_url)
             return 0
         if message == WM_COMMAND:
             return 0
@@ -215,9 +197,14 @@ def run_tray(server, config_path: str):
         return user32.DefWindowProcW(hwnd, message, wparam, lparam)
 
     instance = kernel32.GetModuleHandleW(None)
+    icon_resource = ctypes.cast(ctypes.c_void_p(1), wintypes.LPCWSTR)
+    app_icon = user32.LoadIconW(instance, icon_resource)
+    if not app_icon:
+        app_icon = user32.LoadIconW(None, ctypes.cast(ctypes.c_void_p(IDI_APPLICATION), wintypes.LPCWSTR))
     window_class = WNDCLASSW()
     window_class.lpfnWndProc = window_proc
     window_class.hInstance = instance
+    window_class.hIcon = app_icon
     window_class.lpszClassName = class_name
     if not user32.RegisterClassW(ctypes.byref(window_class)):
         raise ctypes.WinError()
@@ -235,7 +222,7 @@ def run_tray(server, config_path: str):
     icon_data.uID = 1
     icon_data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
     icon_data.uCallbackMessage = TRAY_MESSAGE
-    icon_data.hIcon = user32.LoadIconW(None, IDI_APPLICATION)
+    icon_data.hIcon = app_icon
     icon_data.szTip = "gemini-web2api"
     if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(icon_data)):
         user32.DestroyWindow(hwnd)
@@ -255,5 +242,3 @@ def run_tray(server, config_path: str):
         server_thread.join(timeout=5)
         user32.DestroyWindow(hwnd)
         user32.UnregisterClassW(class_name, instance)
-    if restart_requested:
-        _restart_app()

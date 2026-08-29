@@ -11,6 +11,8 @@ $buildDir = Join-Path $repoRoot "build"
 $launcher = Join-Path $buildDir "pyinstaller-entry.py"
 $cookieLauncher = Join-Path $buildDir "pyinstaller-cookie-entry.py"
 $distDir = Join-Path $repoRoot "dist"
+$logoPath = Join-Path $repoRoot "logo.png"
+$iconPath = Join-Path $buildDir "gemini-web2api.ico"
 $exePath = Join-Path $distDir "gemini-web2api.exe"
 $cookieExePath = Join-Path $distDir "gemini-web2api-cookie.exe"
 
@@ -30,7 +32,7 @@ if (-not (Test-Path $venvPython)) {
     }
 }
 
-& $venvPython -m pip install --disable-pip-version-check -r requirements.txt "pyinstaller>=6,<7"
+& $venvPython -m pip install --disable-pip-version-check -r requirements.txt "pyinstaller>=6,<7" "pillow>=10,<13"
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to install build dependencies."
 }
@@ -52,6 +54,10 @@ if (-not $testsPassed) {
 }
 
 New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
+& $venvPython -c "from PIL import Image; image=Image.open(r'$logoPath').convert('RGBA').crop((64,180,520,636)).resize((256,256),Image.Resampling.LANCZOS); image.save(r'$iconPath',format='ICO',sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to generate Windows icon from logo.png."
+}
 @'
 import json
 import os
@@ -172,6 +178,7 @@ if __name__ == "__main__":
     --clean `
     --onefile `
     --windowed `
+    --icon $iconPath `
     --name gemini-web2api `
     --paths $repoRoot `
     --distpath $distDir `
@@ -187,6 +194,7 @@ if ($LASTEXITCODE -ne 0) {
     --clean `
     --onefile `
     --windowed `
+    --icon $iconPath `
     --name gemini-web2api-cookie `
     --paths $repoRoot `
     --distpath $distDir `
