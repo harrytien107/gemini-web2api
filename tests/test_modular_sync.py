@@ -9,7 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 from urllib.parse import parse_qs
 
-from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
+from gemini_web2api.config import CONFIG, DEFAULT_CONFIG, load_config, save_config_updates
+from gemini_web2api import config as config_module
 from gemini_web2api.gemini import (
     _build_headers,
     _build_payload,
@@ -21,12 +22,22 @@ from gemini_web2api.gemini import (
     extract_response_text,
     generate,
     generate_stream,
+    mark_conversation_recovery_failed,
     refresh_auth,
     reset_conversation,
+    rotate_conversation_thread,
 )
 from gemini_web2api import gemini as gemini_module
 from gemini_web2api import multimodal
-from gemini_web2api.models import resolve_model_chain
+from gemini_web2api.models import (
+    delete_model_combo,
+    reset_model_definition,
+    resolve_model_chain,
+    save_model_combo,
+    save_model_definition,
+    validate_model_combo,
+    validate_model_definition,
+)
 from gemini_web2api.server import (
     GeminiHandler,
     ThreadedServer,
@@ -59,6 +70,128 @@ def _decode_sse(body):
         if event_type and data:
             events.append((event_type, json.loads(data)))
     return events
+
+
+class ConfigPersistenceTests(unittest.TestCase):
+    def setUp(self):
+        self.original_config = dict(CONFIG)
+        self.original_path = config_module.CONFIG_PATH
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.config_path = os.path.join(self.temp_dir.name, "config.json")
+        CONFIG.clear()
+        CONFIG.update(DEFAULT_CONFIG)
+        config_module.CONFIG_PATH = None
+
+    def tearDown(self):
+        CONFIG.clear()
+        CONFIG.update(self.original_config)
+        config_module.CONFIG_PATH = self.original_path
+        self.temp_dir.cleanup()
+
+    def test_load_tracks_missing_explicit_path_for_later_runtime_updates(self):
+        load_config(self.config_path)
+        self.assertEqual(config_module.CONFIG_PATH, os.path.abspath(self.config_path))
+
+        saved = save_config_updates({"model_combos": {"saved": ["gemini-3.7-flash"]}})
+
+        self.assertEqual(saved["model_combos"]["saved"], ["gemini-3.7-flash"])
+        with open(self.config_path, encoding="utf-8") as file:
+            self.assertEqual(json.load(file), saved)
+
+    def test_save_preserves_unrelated_settings_and_rejects_non_object_root(self):
+        with open(self.config_path, "w", encoding="utf-8") as file:
+            json.dump({"port": 9000, "custom": "keep"}, file)
+        load_config(self.config_path)
+
+        save_config_updates({"model_combos": {"fast": ["gemini-3.7-flash"]}})
+
+        with open(self.config_path, encoding="utf-8") as file:
+            saved = json.load(file)
+        self.assertEqual(saved["port"], 9000)
+        self.assertEqual(saved["custom"], "keep")
+        self.assertEqual(saved["model_combos"]["fast"], ["gemini-3.7-flash"])
+
+        with open(self.config_path, "w", encoding="utf-8") as file:
+            json.dump([], file)
+        with self.assertRaisesRegex(ValueError, "JSON object"):
+            save_config_updates({"port": 8081})
+
+
+class ModelConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.original_config = dict(CONFIG)
+        self.original_path = config_module.CONFIG_PATH
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.config_path = os.path.join(self.temp_dir.name, "config.json")
+        CONFIG.clear()
+        CONFIG.update(DEFAULT_CONFIG)
+        config_module.CONFIG_PATH = self.config_path
+
+    def tearDown(self):
+        CONFIG.clear()
+        CONFIG.update(self.original_config)
+        config_module.CONFIG_PATH = self.original_path
+        self.temp_dir.cleanup()
+
+    def test_model_combo_crud_persists_normalized_config(self):
+        saved = save_model_combo("balanced", {
+            "strategy": "round_robin",
+            "models": ["gemini-3.7-flash", "gemini-3.6-flash@think=2"],
+        })
+        self.assertEqual(saved["strategy"], "round_robin")
+        self.assertEqual(resolve_model_chain("balanced")[1][1][2], 2)
+        with open(self.config_path, encoding="utf-8") as file:
+            self.assertIn("balanced", json.load(file)["model_combos"])
+
+        updated = save_model_combo("balanced", ["gemini-auto"])
+        self.assertEqual(updated["strategy"], "fallback")
+        self.assertTrue(delete_model_combo("balanced"))
+        self.assertFalse(delete_model_combo("balanced"))
+        self.assertNotIn("balanced", CONFIG["model_combos"])
+
+    def test_model_combo_validation_rejects_model_collision_nested_or_bad_names(self):
+        CONFIG["model_combos"] = {
+            "parent": {"strategy": "fallback", "models": ["gemini-3.7-flash"]}
+        }
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            validate_model_combo("gemini-3.7-flash", ["gemini-auto"])
+        with self.assertRaisesRegex(ValueError, "nested"):
+            validate_model_combo("child", ["parent"])
+        with self.assertRaisesRegex(ValueError, "1-128"):
+            validate_model_combo("bad/name", ["gemini-auto"])
+        with self.assertRaisesRegex(ValueError, "strategy"):
+            validate_model_combo("bad-strategy", {
+                "strategy": "random", "models": ["gemini-auto"]
+            })
+
+    def test_raw_model_add_override_reset_and_validation(self):
+        added = save_model_definition("gemini-local", {
+            "mode": 2,
+            "think": 1,
+            "description": "Local raw model",
+            "extra": {"31": 2},
+        })
+        self.assertFalse(added["default"])
+        self.assertEqual(resolve_model_chain("gemini-local")[1][0][1:], (2, 1, {31: 2}))
+
+        overridden = save_model_definition("gemini-3.7-flash", {
+            "mode": 3, "think": 2, "desc": "Override"
+        })
+        self.assertTrue(overridden["default"])
+        self.assertEqual(resolve_model_chain("gemini-3.7-flash")[1][0][1:3], (3, 2))
+        self.assertTrue(reset_model_definition("gemini-3.7-flash"))
+        self.assertEqual(resolve_model_chain("gemini-3.7-flash")[1][0][1:3], (1, 4))
+        self.assertTrue(reset_model_definition("gemini-local"))
+        self.assertTrue(resolve_model_chain("gemini-local")[2])
+
+        with self.assertRaisesRegex(ValueError, "mode"):
+            validate_model_definition("bad-mode", {"mode": 7, "think": 0})
+        with self.assertRaisesRegex(ValueError, "think"):
+            validate_model_definition("bad-think", {"mode": 1, "think": 5})
+        with self.assertRaisesRegex(ValueError, "indexes"):
+            validate_model_definition("bad-extra", {
+                "mode": 1, "think": 0, "extra": {"81": 1}
+            })
 
 
 class AuthReloadTests(unittest.TestCase):
@@ -543,6 +676,13 @@ class ComboModelTests(unittest.TestCase):
         CONFIG.clear()
         CONFIG.update(self.original_config)
 
+    def test_gemini_3_8_flash_is_builtin_fast_model(self):
+        self.assertIn("gemini-3.8-flash", _model_catalog())
+        name, attempts, error = resolve_model_chain("gemini-3.8-flash")
+        self.assertEqual(name, "gemini-3.8-flash")
+        self.assertIsNone(error)
+        self.assertEqual(attempts, [("gemini-3.8-flash", 1, 4, None)])
+
     def test_fallback_combo_is_exposed_when_configured(self):
         self.assertIn("gemini-combo", _model_catalog())
         name, attempts, error = resolve_model_chain("gemini-combo")
@@ -709,12 +849,14 @@ class StreamingEndpointTests(unittest.TestCase):
 
     def setUp(self):
         self.original_config = dict(CONFIG)
+        self.original_config_path = config_module.CONFIG_PATH
         self.conversation_dir = tempfile.TemporaryDirectory()
         CONFIG["api_keys"] = []
         CONFIG["log_requests"] = False
         CONFIG["conversation_store_file"] = os.path.join(
             self.conversation_dir.name, "conversations.json"
         )
+        config_module.CONFIG_PATH = os.path.join(self.conversation_dir.name, "config.json")
         import gemini_web2api.server as server_module
         server_module._chat_history = []
         server_module._chat_histories.clear()
@@ -733,6 +875,7 @@ class StreamingEndpointTests(unittest.TestCase):
         reset_conversation()
         CONFIG.clear()
         CONFIG.update(self.original_config)
+        config_module.CONFIG_PATH = self.original_config_path
         self.conversation_dir.cleanup()
 
     def post_json(self, path, payload, headers=None):
@@ -781,19 +924,101 @@ class StreamingEndpointTests(unittest.TestCase):
         connection.close()
         return response.status, headers, body
 
-    def test_browser_conversation_manager_supports_empty_api_keys(self):
-        status, headers, body = self.get_json("/conversations")
+    def request_json(self, method, path, payload=None):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(
+            method,
+            path,
+            body=json.dumps(payload).encode() if payload is not None else None,
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        body = response.read().decode()
+        headers = dict(response.getheaders())
+        connection.close()
+        return response.status, headers, body
+
+    def test_browser_session_manager_supports_empty_api_keys(self):
+        status, headers, body = self.get_json("/sessions")
 
         self.assertEqual(status, 200)
         self.assertEqual(headers["Content-Type"], "text/html; charset=utf-8")
-        self.assertIn("Gemini Conversations", body)
+        self.assertIn("Session Manager", body)
+        self.assertIn("Model Manager", body)
         self.assertIn("leave empty when api_keys is []", body)
+        self.assertIn("Reset clears only current Gemini Web thread", body)
 
         status, _, body = self.post_json(
             "/v1/conversations", {"id": "browser-created"}
         )
         self.assertEqual(status, 201)
         self.assertTrue(json.loads(body)["active"])
+
+    def test_stats_endpoint_is_redacted_and_reports_runtime_shape(self):
+        status, _, body = self.get_json("/v1/stats")
+
+        self.assertEqual(status, 200)
+        stats = json.loads(body)
+        self.assertIn(stats["auth"]["state"], ("authenticated", "anonymous"))
+        self.assertEqual(set(stats["auth"]), {"state", "error"})
+        self.assertGreaterEqual(stats["uptime_seconds"], 0)
+        for field in (
+            "requests", "successes", "failures", "rollovers", "sessions", "custom_models"
+        ):
+            self.assertIsInstance(stats[field], int)
+        self.assertNotIn("path", stats["auth"])
+
+    def test_model_manager_api_crud_and_raw_model_editing(self):
+        status, _, body = self.post_json("/v1/model-config", {
+            "name": "api-chain",
+            "strategy": "fallback",
+            "models": ["gemini-3.7-flash", "gemini-auto"],
+        })
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["name"], "api-chain")
+
+        status, _, body = self.get_json("/v1/model-config")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertIn("gemini-3.7-flash", [item["name"] for item in payload["builtins"]])
+        self.assertEqual([item["name"] for item in payload["custom"]], ["api-chain"])
+
+        status, _, body = self.request_json("PUT", "/v1/model-config/api-chain", {
+            "strategy": "round_robin",
+            "models": ["gemini-auto", "gemini-3.6-flash"],
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["strategy"], "round_robin")
+
+        status, _, body = self.post_json("/v1/model-definitions", {
+            "name": "gemini-api-raw", "mode": 2, "think": 1, "desc": "API raw"
+        })
+        self.assertEqual(status, 201)
+        self.assertFalse(json.loads(body)["default"])
+        status, _, body = self.request_json(
+            "PUT", "/v1/model-definitions/gemini-3.7-flash",
+            {"mode": 3, "think": 2, "desc": "Edited default"},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["default"])
+        status, _, body = self.get_json("/v1/model-config")
+        raw = {item["name"]: item for item in json.loads(body)["builtins"]}
+        self.assertTrue(raw["gemini-3.7-flash"]["customized"])
+        self.assertFalse(raw["gemini-api-raw"]["default"])
+        status, _, body = self.request_json(
+            "DELETE", "/v1/model-definitions/gemini-3.7-flash"
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["reset"])
+        status, _, body = self.request_json(
+            "DELETE", "/v1/model-definitions/gemini-api-raw"
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["deleted"])
+
+        status, _, body = self.request_json("DELETE", "/v1/model-config/api-chain")
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["deleted"])
 
     def test_chat_requires_model(self):
         status, _, body = self.post_json(
@@ -877,6 +1102,183 @@ class StreamingEndpointTests(unittest.TestCase):
         ])
         reset.assert_not_called()
 
+    @mock.patch("gemini_web2api.server.rotate_conversation_thread")
+    @mock.patch(
+        "gemini_web2api.server.conversation_info",
+        return_value={"metadata": ["old-cid", "old-rid", "old-rcid"]},
+    )
+    @mock.patch(
+        "gemini_web2api.server.generate",
+        side_effect=[GeminiUpstreamError(1097), "recovered", "next response"],
+    )
+    def test_chat_rolls_over_rejected_thread_and_returns_to_incremental_mode(
+        self, generate, conversation_info_mock, rotate
+    ):
+        conversation_id = "rollover-chat"
+        headers = {"X-Conversation-ID": conversation_id}
+        previous = [
+            {"role": "user", "content": "old question"},
+            {"role": "assistant", "content": "old answer"},
+        ]
+        messages = previous + [{"role": "user", "content": "follow up"}]
+        _commit_chat_messages(previous, conversation_id)
+
+        status, response_headers, body = self.post_json(
+            "/v1/chat/completions",
+            {"model": "gemini-3.6-flash", "messages": messages},
+            headers,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response_headers["X-Conversation-ID"], conversation_id)
+        self.assertEqual(json.loads(body)["choices"][0]["message"]["content"], "recovered")
+        self.assertEqual(generate.call_count, 2)
+        first_prompt = generate.call_args_list[0].args[0]
+        recovery_prompt = generate.call_args_list[1].args[0]
+        self.assertIn("follow up", first_prompt)
+        self.assertNotIn("old question", first_prompt)
+        self.assertIn("old question", recovery_prompt)
+        self.assertIn("old answer", recovery_prompt)
+        self.assertIn("follow up", recovery_prompt)
+        rotate.assert_called_once_with(
+            conversation_id, error_code=1097, recovery="full-history"
+        )
+        conversation_info_mock.assert_called_once_with(conversation_id)
+
+        next_messages = messages + [
+            {"role": "assistant", "content": "recovered"},
+            {"role": "user", "content": "next turn"},
+        ]
+        status, _, _ = self.post_json(
+            "/v1/chat/completions",
+            {"model": "gemini-3.6-flash", "messages": next_messages},
+            headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(generate.call_count, 3)
+        next_prompt = generate.call_args_list[2].args[0]
+        self.assertIn("next turn", next_prompt)
+        self.assertNotIn("old question", next_prompt)
+
+    @mock.patch("gemini_web2api.server.rotate_conversation_thread")
+    @mock.patch(
+        "gemini_web2api.server.conversation_info",
+        return_value={"metadata": ["old-cid", "old-rid", "old-rcid"]},
+    )
+    @mock.patch("gemini_web2api.server.generate_stream")
+    def test_chat_stream_rolls_over_before_sse_output(
+        self, generate_stream, _conversation_info, rotate
+    ):
+        def rejected():
+            raise GeminiUpstreamError(1096)
+            yield ""
+
+        generate_stream.side_effect = [rejected(), iter(["recovered", " stream"])]
+        conversation_id = "stream-rollover"
+
+        status, headers, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+            {"X-Conversation-ID": conversation_id},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/event-stream")
+        content = [
+            json.loads(line[len("data: "):])["choices"][0]["delta"].get("content")
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+        self.assertEqual([part for part in content if part is not None], ["recovered", " stream"])
+        self.assertEqual(generate_stream.call_count, 2)
+        rotate.assert_called_once_with(
+            conversation_id, error_code=1096, recovery="full-history"
+        )
+
+    @mock.patch("gemini_web2api.server.rotate_conversation_thread")
+    @mock.patch("gemini_web2api.server.generate_stream")
+    def test_chat_stream_never_rolls_over_after_output_starts(
+        self, generate_stream, rotate
+    ):
+        def partial_then_rejected():
+            yield "partial"
+            raise GeminiUpstreamError(1096)
+
+        generate_stream.return_value = partial_then_rejected()
+
+        status, headers, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+            {"X-Conversation-ID": "partial-stream"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/event-stream")
+        self.assertIn('"content": "partial"', body)
+        rotate.assert_not_called()
+        generate_stream.assert_called_once()
+
+    @mock.patch("gemini_web2api.server.rotate_conversation_thread")
+    @mock.patch(
+        "gemini_web2api.server.conversation_info",
+        return_value={"metadata": ["old-cid", "old-rid", "old-rcid"]},
+    )
+    @mock.patch("gemini_web2api.server.generate_stream")
+    def test_chat_stream_rollover_retries_only_once(
+        self, generate_stream, _conversation_info, rotate
+    ):
+        def rejected(code):
+            def stream():
+                raise GeminiUpstreamError(code)
+                yield ""
+            return stream()
+
+        generate_stream.side_effect = [rejected(1097), rejected(1097)]
+        conversation_id = "stream-dead"
+
+        status, headers, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+            {"X-Conversation-ID": conversation_id},
+        )
+
+        self.assertEqual(status, 502)
+        self.assertEqual(headers["Content-Type"], "application/json")
+        self.assertIn("error 1097", json.loads(body)["error"]["message"])
+        self.assertEqual(generate_stream.call_count, 2)
+        rotate.assert_called_once_with(
+            conversation_id, error_code=1097, recovery="full-history"
+        )
+
+    @mock.patch("gemini_web2api.server.rotate_conversation_thread")
+    @mock.patch("gemini_web2api.server.generate", side_effect=GeminiUpstreamError(1100))
+    def test_chat_does_not_roll_over_non_thread_rejection(self, generate, rotate):
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            {"X-Conversation-ID": "no-rollover"},
+        )
+
+        self.assertEqual(status, 502)
+        self.assertIn("error 1100", json.loads(body)["error"]["message"])
+        generate.assert_called_once()
+        rotate.assert_not_called()
+
     @mock.patch("gemini_web2api.server.generate", return_value="active session")
     def test_selected_conversation_applies_without_custom_client_headers(self, generate):
         status, _, body = self.post_json(
@@ -919,8 +1321,11 @@ class StreamingEndpointTests(unittest.TestCase):
         status, _, body = self.post_json("/v1/conversations/site-chat/reset", {})
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(body)["reset"])
-        status, _, _ = self.get_json("/v1/conversations/site-chat")
-        self.assertEqual(status, 404)
+        status, _, body = self.get_json("/v1/conversations/site-chat")
+        self.assertEqual(status, 200)
+        reset_info = json.loads(body)
+        self.assertEqual(reset_info["metadata"][:3], ["", "", ""])
+        self.assertEqual(reset_info["health"], "Empty")
 
     def test_existing_conversation_can_be_selected(self):
         self.post_json("/v1/conversations", {"id": "first"})
@@ -944,6 +1349,39 @@ class StreamingEndpointTests(unittest.TestCase):
             conversation_info("persisted", auth)["metadata"][:3],
             ["cid", "rid", "rcid"],
         )
+
+    def test_rotate_conversation_thread_preserves_named_session_and_lifecycle(self):
+        auth = gemini_module.refresh_auth()
+        create_conversation(
+            "rotate-me", ["cid", "rid", "rcid"], auth, select=True
+        )
+
+        rotate_conversation_thread(
+            "rotate-me", auth, error_code=1097, recovery="full-history"
+        )
+
+        info = conversation_info("rotate-me", auth)
+        self.assertIsNotNone(info)
+        self.assertTrue(info["active"])
+        self.assertEqual(info["metadata"][:3], ["", "", ""])
+        self.assertEqual(info["health"], "Error")
+        self.assertEqual(info["thread_generation"], 2)
+        self.assertEqual(info["rollover_count"], 1)
+        self.assertEqual(info["rollover_history"][-1]["status"], "recovering")
+
+        mark_conversation_recovery_failed("rotate-me", auth, error_code=1097)
+        failed = conversation_info("rotate-me", auth)
+        self.assertEqual(failed["health"], "Error")
+        self.assertEqual(failed["rollover_history"][-1]["status"], "failed")
+
+        gemini_module._update_conversation_metadata(
+            json.dumps([["wrb.fr", None, json.dumps([None, ["new-cid", "new-rid", "new-rcid"]])]]),
+            auth,
+            "rotate-me",
+        )
+        recovered = conversation_info("rotate-me", auth)
+        self.assertEqual(recovered["health"], "Recovered")
+        self.assertEqual(recovered["metadata"][:3], ["new-cid", "new-rid", "new-rcid"])
 
     def test_conversation_ids_isolate_payload_metadata(self):
         auth = gemini_module.refresh_auth()

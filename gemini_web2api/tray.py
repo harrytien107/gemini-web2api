@@ -5,7 +5,7 @@ import threading
 import webbrowser
 from ctypes import wintypes
 
-from .gemini import auth_status
+from .gemini import active_conversation_id, auth_status
 
 
 WM_DESTROY = 0x0002
@@ -27,7 +27,8 @@ TPM_RETURNCMD = 0x0100
 OPEN_API = 1001
 OPEN_CONFIG = 1002
 COPY_ENDPOINT = 1003
-MANAGE_CONVERSATIONS = 1004
+MANAGE_SESSIONS = 1004
+MANAGE_MODELS = 1005
 EXIT = 1006
 TRAY_MESSAGE = WM_USER + 1
 CF_UNICODETEXT = 13
@@ -108,7 +109,8 @@ def run_tray(server, config_path: str):
     shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
     base_url = f"http://localhost:{server.server_address[1]}/v1"
     api_url = f"{base_url}/models"
-    conversations_url = f"http://localhost:{server.server_address[1]}/conversations"
+    sessions_url = f"http://localhost:{server.server_address[1]}/sessions"
+    models_url = sessions_url + "#models"
     class_name = "GeminiWeb2ApiTray"
 
     def open_config():
@@ -151,11 +153,15 @@ def run_tray(server, config_path: str):
             auth_label = "Auth: Anonymous (auth file error)"
         else:
             auth_label = "Auth: Anonymous"
+        active_id = active_conversation_id()
+        active_label = f"Active session: {active_id}" if active_id else "Active session: none"
         menu = user32.CreatePopupMenu()
         try:
             user32.AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, auth_label)
+            user32.AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, active_label)
             user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-            user32.AppendMenuW(menu, MF_STRING, MANAGE_CONVERSATIONS, "Manage conversations")
+            user32.AppendMenuW(menu, MF_STRING, MANAGE_SESSIONS, "Session Manager")
+            user32.AppendMenuW(menu, MF_STRING, MANAGE_MODELS, "Model Manager")
             user32.AppendMenuW(menu, MF_STRING, OPEN_API, "Open API")
             user32.AppendMenuW(menu, MF_STRING, COPY_ENDPOINT, "Copy endpoint")
             user32.AppendMenuW(menu, MF_STRING, OPEN_CONFIG, "Open config.json")
@@ -168,8 +174,10 @@ def run_tray(server, config_path: str):
                 menu, TPM_RIGHTBUTTON | TPM_RETURNCMD,
                 point.x, point.y, 0, hwnd, None,
             )
-            if command == MANAGE_CONVERSATIONS:
-                webbrowser.open(conversations_url)
+            if command == MANAGE_SESSIONS:
+                webbrowser.open(sessions_url)
+            elif command == MANAGE_MODELS:
+                webbrowser.open(models_url)
             elif command == OPEN_API:
                 webbrowser.open(api_url)
             elif command == COPY_ENDPOINT:
@@ -187,7 +195,7 @@ def run_tray(server, config_path: str):
             if lparam == WM_RBUTTONUP:
                 show_menu(hwnd)
             elif lparam == WM_LBUTTONDBLCLK:
-                webbrowser.open(conversations_url)
+                webbrowser.open(sessions_url)
             return 0
         if message == WM_COMMAND:
             return 0

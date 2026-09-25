@@ -45,7 +45,7 @@ dist\gemini-web2api.exe
 dist\gemini-web2api-cookie.exe
 ```
 
-Run them without Python or a virtual environment. They start without a console window and remain available from the Windows notification area with the Gemini icon. Double-click the tray icon to open the conversation manager; right-click it to see the live **Auth: Cookie loaded** or **Auth: Anonymous** status and actions for **Manage conversations**, **Open API**, **Copy endpoint**, **Open config.json**, and **Exit**. The status refreshes whenever the menu opens, so auth-file hot reloads are reflected immediately. **Copy endpoint** copies `http://localhost:8081/v1` using the active port. Use **Exit** to stop the HTTP server cleanly:
+Run them without Python or a virtual environment. They start without a console window and remain available from the Windows notification area with the Gemini icon. Double-click the tray icon to open **Session Manager**; right-click it to see live auth and active-session status plus shortcuts for **Session Manager**, **Model Manager**, **Open API**, **Copy endpoint**, **Open config.json**, and **Exit**. Model Manager opens the model section inside Session Manager. Status refreshes whenever the menu opens, so auth-file hot reloads appear immediately. **Copy endpoint** copies `http://localhost:8081/v1` using the active port. Use **Exit** to stop the HTTP server cleanly:
 
 ```powershell
 .\dist\gemini-web2api.exe
@@ -126,9 +126,9 @@ Supports Google native API endpoints:
 - `POST /v1beta/models/{model}:generateContent` — non-streaming
 - `POST /v1beta/models/{model}:streamGenerateContent` — streaming (SSE)
 
-## Persistent conversations
+## Persistent sessions
 
-For portable Windows builds, double-click the tray icon or right-click it and choose **Manage conversations**. The browser page creates, selects, lists, and resets sessions. If `api_keys` is `[]`, leave its API-key field empty. No command line is required.
+For portable Windows builds, double-click the tray icon or right-click it and choose **Session Manager**. The browser page creates, selects, lists, and resets sessions; shows Healthy, Recovered, Empty, or Error health; exposes thread generation and bounded rollover history; and displays redacted runtime stats. If `api_keys` is `[]`, leave its API-key field empty. No command line is required. `/conversations` remains an alias for `/sessions`.
 
 Create and select a conversation once, then use an ordinary OpenAI client without custom headers. The selected conversation remains active across model changes and executable restarts:
 
@@ -144,16 +144,17 @@ X-Conversation-ID: my-overlay-chat
 
 The JSON request field `conversation_id` is also accepted. Selection precedence is header, request field, then the process-wide active conversation.
 
-Conversation management endpoints:
+Session management endpoints:
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /v1/conversations` | Create and select a conversation. Body: `{"id":"my-chat"}`. Omit `id` to generate one. |
-| `GET /v1/conversations` | List saved conversations for the current Gemini account. |
-| `GET /v1/conversations/{id}` | Inspect saved Gemini metadata. |
-| `POST /v1/conversations/{id}/select` | Make a saved conversation the default for clients without custom headers. |
-| `POST /v1/conversations/{id}/reset` | Delete its metadata and clear it if selected. |
-| `POST /v1/conversations/{id}/attach` | Attach an existing Gemini Web chat using `cid`, `rid`, and `rcid`. |
+| `POST /v1/conversations` | Create and select a local session. Body: `{"id":"my-chat"}`. Omit `id` to generate one. |
+| `GET /v1/conversations` | List saved sessions, health, thread generation, and rollover history for current Gemini account. |
+| `GET /v1/conversations/{id}` | Inspect one saved session and its Gemini metadata. |
+| `POST /v1/conversations/{id}/select` | Make saved session default for clients without custom headers. |
+| `POST /v1/conversations/{id}/reset` | Clear current Gemini Web thread while preserving local session and rollover history. |
+| `POST /v1/conversations/{id}/attach` | Attach existing Gemini Web chat using `cid`, `rid`, and `rcid`. |
+| `GET /v1/stats` | Return redacted process uptime, auth state, active session, request results, and rollover counters. |
 
 Attach an existing Gemini Web conversation after obtaining all three private metadata values:
 
@@ -161,21 +162,37 @@ Attach an existing Gemini Web conversation after obtaining all three private met
 curl.exe --% -X POST http://127.0.0.1:8081/v1/conversations/site-chat/attach -H "Content-Type: application/json" -H "Authorization: Bearer sk-your-key" -d "{\"cid\":\"...\",\"rid\":\"...\",\"rcid\":\"...\"}"
 ```
 
-The Gemini URL generally exposes only `cid`; continuing the latest branch reliably also requires `rid` and `rcid`. The adapter does not currently discover those two values from a URL. Conversations created through this API capture all three automatically.
+The Gemini URL generally exposes only `cid`; continuing the latest branch reliably also requires `rid` and `rcid`. The adapter does not currently discover those two values from a URL. Sessions created through this API capture all three automatically.
 
-Named metadata is stored in `gemini-conversations.json` beside a portable executable. Set `conversation_store_file` to override that location. The store contains private Gemini conversation IDs and an account-session fingerprint, not raw cookies, but it should still remain private. A selected conversation deliberately survives rebuilt message history; use its reset endpoint when the overlay starts a genuinely new chat.
+Named metadata is stored in `gemini-conversations.json` beside a portable executable. Set `conversation_store_file` to override that location. Store format v2 remains backward-compatible and includes thread generation, rollover count/history, last error, and recovery state. It contains private Gemini conversation IDs and an account-session fingerprint, not raw cookies, but should still remain private. A selected session deliberately survives rebuilt message history. Use its reset endpoint when overlay starts a genuinely new chat.
 
 ## Available Models
 
 | Model | Description | Output |
 |-------|-------------|--------|
-| `gemini-3.6-flash` | All-around model (latest) | ~12k chars |
+| `gemini-3.8-flash` | Latest all-around model | ~12k chars |
+| `gemini-3.7-flash` | All-around model | ~12k chars |
+| `gemini-3.6-flash` | All-around model | ~12k chars |
 | `gemini-3.5-flash` | Alias for gemini-3.6-flash | ~12k chars |
 | `gemini-3.5-flash-thinking` | Extended thinking, longest output | **~20k chars** |
 | `gemini-3.5-flash-thinking-lite` | Adaptive thinking depth | ~15k chars |
 | `gemini-3.1-pro` | Advanced math & code (needs cookie) | ~12k chars |
 | `gemini-auto` | Auto model selection | varies |
 | `gemini-flash-lite` | Fastest answers, lightweight | ~10k chars |
+
+### Model Manager
+
+Open **Model Manager** from tray or visit `http://localhost:8081/sessions#models`. It can add raw model definitions, override built-in model routing fields, restore hardcoded defaults, and manage custom `fallback` or `round_robin` chains. Changes are validated and atomically persisted to active `config.json`; unrelated settings remain untouched. Raw definitions use Gemini frontend `mode` values `1`–`6`, `think` values `0`–`4`, optional description, and optional payload `extra` fields. Custom chains cannot contain other custom chains.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /v1/model-config` | List effective raw models and editable custom chains. |
+| `POST /v1/model-definitions` | Add raw model. Body includes `name`, `mode`, `think`, optional `desc`, and optional `extra`. |
+| `PUT /v1/model-definitions/{name}` | Edit raw model or override built-in definition. |
+| `DELETE /v1/model-definitions/{name}` | Delete added model or restore built-in default. |
+| `POST /v1/model-config` | Create custom chain. Body includes `name`, `strategy`, and `models`. |
+| `PUT /v1/model-config/{name}` | Replace existing custom chain. |
+| `DELETE /v1/model-config/{name}` | Delete custom chain. |
 
 ### Thinking Depth
 
@@ -227,6 +244,7 @@ Create `config.json` in the same directory:
   "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
   "auth_user": null,
   "xsrf_token": null,
+  "model_definitions": {},
   "model_combos": {
     "gemini-combo": {
       "strategy": "fallback",
@@ -258,7 +276,7 @@ Create `config.json` in the same directory:
 Set `temporary_chats` to `true` to use Gemini Web temporary chats instead of
 persisting conversations to the account history. Named conversation selection is intended for persistent chats; temporary mode may cause Gemini to clear upstream context.
 
-Each `model_combos` key becomes a virtual model exposed by `/v1/models`; clients can request `gemini-combo`, `gemini-deep`, or any other configured name. `fallback` starts every request at the first model. `round_robin` rotates the first model per request, then uses the remaining models as fallbacks. Rotation is in memory and resets when the process restarts. An array value is shorthand for `fallback`. OpenAI-compatible Chat Completions and Responses requests must include a non-empty `model`; missing models return HTTP 400. Models fall back after an upstream error or empty response. `@think=N` overrides the thinking level for that attempt. Streaming falls back only before any content is emitted, preventing mixed model output. Combo nesting, invalid strategies, and invalid model names reject the request.
+Each `model_definitions` key adds a raw model or overrides a hardcoded model. Removing an override restores its hardcoded default. Each `model_combos` key becomes a virtual model exposed by `/v1/models`; clients can request `gemini-combo`, `gemini-deep`, or any other configured name. `fallback` starts every request at the first model. `round_robin` rotates the first model per request, then uses remaining models as fallbacks. Rotation is in memory and resets when process restarts. An array value is shorthand for `fallback`. OpenAI-compatible Chat Completions and Responses requests must include a non-empty `model`; missing models return HTTP 400. Models fall back after an upstream error or empty response. `@think=N` overrides thinking level for that attempt. Streaming falls back only before content is emitted, preventing mixed model output. Combo nesting, invalid strategies, and invalid model names reject request.
 
 When `api_keys` is `[]`, authentication is disabled. When one or more keys are set, `/v1/*` endpoints require `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
@@ -348,7 +366,8 @@ resp = client.chat.completions.create(
 
 - **Image upload may require cookies**: Multimodal input uses Gemini Web's image upload endpoint. If anonymous upload fails, configure a Gemini cookie.
 - **Not real Pro/Ultra**: Without a paid subscription cookie, `gemini-3.1-pro` routes to the same Flash model. The "Pro" label is a UI preference, not a backend model switch.
-- **One active conversation**: Sequential overlay requests reuse one Gemini Web conversation. Clearing or replacing the overlay message history resets the upstream conversation. Run separate server instances on separate ports for concurrent independent overlays.
+- **One process-wide default session**: Sequential clients without explicit IDs use selected session. Use `X-Conversation-ID`, request `conversation_id`, or separate server instances for concurrent independent overlays. Replacing history for an explicit named session does not silently delete it.
+- **Automatic thread rollover**: For Chat Completions, existing saved Gemini thread rejected with error 1096 or 1097 rotates once before output starts. Local session ID stays unchanged and replacement thread rebuilds from client's full message history. Rollover never occurs after streamed output begins, never retries more than once, and never applies to 1100 or other codes. Failed recovery remains visible as Error health.
 - **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.
 
 ## Requirements

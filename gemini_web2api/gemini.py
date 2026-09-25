@@ -261,6 +261,32 @@ def _conversation_file() -> str:
     return os.path.join(base, "gemini-conversations.json")
 
 
+def _conversation_state(auth_key, metadata=None, updated_at=None, **extra) -> dict:
+    values = list(metadata or _EMPTY_CONVERSATION_METADATA)
+    return {
+        "auth_key": auth_key,
+        "metadata": values,
+        "updated_at": int(updated_at or time.time()),
+        "thread_generation": int(extra.get("thread_generation") or 1),
+        "rollover_count": int(extra.get("rollover_count") or 0),
+        "rollover_history": list(extra.get("rollover_history") or []),
+        "last_error": extra.get("last_error"),
+        "last_recovery": extra.get("last_recovery"),
+        "recovery_pending": bool(extra.get("recovery_pending", False)),
+    }
+
+
+def _conversation_health(state: dict) -> str:
+    metadata = state.get("metadata") or []
+    if state.get("recovery_pending"):
+        return "Error"
+    if not (metadata and metadata[0]):
+        return "Empty"
+    if int(state.get("rollover_count") or 0) > 0:
+        return "Recovered"
+    return "Healthy"
+
+
 def _load_conversation_store() -> None:
     global _active_conversation_id, _conversation_store_loaded, _conversation_store_path
     path = _conversation_file()
@@ -291,23 +317,33 @@ def _load_conversation_store() -> None:
             metadata = state.get("metadata")
             if (isinstance(auth_key, list) and len(auth_key) == 2
                     and isinstance(metadata, list)):
-                _conversation_states[conversation_id] = {
-                    "auth_key": tuple(str(value) for value in auth_key),
-                    "metadata": list(metadata),
-                    "updated_at": int(state.get("updated_at") or 0),
-                }
+                _conversation_states[conversation_id] = _conversation_state(
+                    tuple(str(value) for value in auth_key), metadata, state.get("updated_at") or 0,
+                    thread_generation=state.get("thread_generation", 1),
+                    rollover_count=state.get("rollover_count", 0),
+                    rollover_history=state.get("rollover_history", []),
+                    last_error=state.get("last_error"),
+                    last_recovery=state.get("last_recovery"),
+                    recovery_pending=state.get("recovery_pending", False),
+                )
 
 
 def _save_conversation_store() -> None:
     path = _conversation_store_path or _conversation_file()
     payload = {
-        "version": 1,
+        "version": 2,
         "active_conversation_id": _active_conversation_id,
         "conversations": {
             conversation_id: {
                 "auth_key": list(state["auth_key"]),
                 "metadata": state["metadata"],
                 "updated_at": state.get("updated_at", 0),
+                "thread_generation": state.get("thread_generation", 1),
+                "rollover_count": state.get("rollover_count", 0),
+                "rollover_history": state.get("rollover_history", []),
+                "last_error": state.get("last_error"),
+                "last_recovery": state.get("last_recovery"),
+                "recovery_pending": state.get("recovery_pending", False),
             }
             for conversation_id, state in _conversation_states.items()
             if conversation_id != _DEFAULT_CONVERSATION_ID
@@ -338,11 +374,7 @@ def create_conversation(conversation_id: str, metadata: list = None, auth: dict 
         values.extend(_EMPTY_CONVERSATION_METADATA[len(values):])
     global _active_conversation_id
     with _conversation_lock:
-        _conversation_states[conversation_id] = {
-            "auth_key": _auth_key(auth),
-            "metadata": values,
-            "updated_at": int(time.time()),
-        }
+        _conversation_states[conversation_id] = _conversation_state(_auth_key(auth), values)
         if select:
             _active_conversation_id = conversation_id
         _save_conversation_store()
@@ -365,6 +397,12 @@ def conversation_info(conversation_id: str, auth: dict = None) -> dict:
             "rid": metadata[1] if len(metadata) > 1 else "",
             "rcid": metadata[2] if len(metadata) > 2 else "",
             "updated_at": state.get("updated_at", 0),
+            "thread_generation": state.get("thread_generation", 1),
+            "rollover_count": state.get("rollover_count", 0),
+            "rollover_history": list(state.get("rollover_history", [])),
+            "last_error": state.get("last_error"),
+            "last_recovery": state.get("last_recovery"),
+            "health": _conversation_health(state),
         }
 
 
@@ -402,12 +440,73 @@ def reset_conversation(conversation_id: str = None) -> None:
     _load_conversation_store()
     key = _conversation_key(conversation_id)
     with _conversation_lock:
-        _conversation_states.pop(key, None)
-        if conversation_id:
-            if _active_conversation_id == conversation_id:
-                _active_conversation_id = None
+        state = _conversation_states.get(key)
+        if conversation_id and state:
+            state["metadata"] = list(_EMPTY_CONVERSATION_METADATA)
+            state["updated_at"] = int(time.time())
+            state["last_error"] = None
+            state["last_recovery"] = None
+            state["recovery_pending"] = False
             _save_conversation_store()
+        else:
+            _conversation_states.pop(key, None)
     log(f"Gemini conversation reset: {conversation_id or 'default'}")
+
+
+def rotate_conversation_thread(conversation_id: str = None, auth: dict = None,
+                               error_code=None, recovery: str = "full-history") -> None:
+    """Drop only Gemini's upstream thread metadata while keeping the local session."""
+    _load_conversation_store()
+    auth = auth or refresh_auth()
+    key = _conversation_key(conversation_id)
+    with _conversation_lock:
+        state = _conversation_states.get(key)
+        if not state or state.get("auth_key") != _auth_key(auth):
+            state = _conversation_state(_auth_key(auth))
+            _conversation_states[key] = state
+        generation = int(state.get("thread_generation") or 1)
+        now = int(time.time())
+        history = list(state.get("rollover_history") or [])
+        history.append({
+            "generation": generation, "error": error_code, "time": now,
+            "recovery": recovery, "status": "recovering",
+        })
+        # ponytail: Keep latest 20 rotations; move to an audit DB if longer retention is needed.
+        history = history[-20:]
+        state.update({
+            "metadata": list(_EMPTY_CONVERSATION_METADATA),
+            "updated_at": now,
+            "thread_generation": generation + 1,
+            "rollover_count": int(state.get("rollover_count") or 0) + 1,
+            "rollover_history": history,
+            "last_error": error_code,
+            "last_recovery": recovery,
+            "recovery_pending": True,
+        })
+        if conversation_id:
+            _save_conversation_store()
+    log(f"Gemini upstream thread rotated: {conversation_id or 'default'}")
+
+
+def mark_conversation_recovery_failed(conversation_id: str = None, auth: dict = None,
+                                      error_code=None) -> None:
+    """Record one failed rollover recovery without rotating the thread again."""
+    _load_conversation_store()
+    auth = auth or refresh_auth()
+    key = _conversation_key(conversation_id)
+    with _conversation_lock:
+        state = _conversation_states.get(key)
+        if not state or state.get("auth_key") != _auth_key(auth):
+            return
+        history = list(state.get("rollover_history") or [])
+        if history and history[-1].get("status") == "recovering":
+            history[-1] = dict(history[-1], status="failed", recovery_error=error_code)
+            state["rollover_history"] = history
+        state["last_error"] = error_code or state.get("last_error")
+        state["recovery_pending"] = True
+        state["updated_at"] = int(time.time())
+        if conversation_id:
+            _save_conversation_store()
 
 
 def _conversation_metadata(auth: dict, conversation_id: str = None) -> list:
@@ -417,11 +516,7 @@ def _conversation_metadata(auth: dict, conversation_id: str = None) -> list:
     with _conversation_lock:
         state = _conversation_states.get(key)
         if not state or state["auth_key"] != auth_key:
-            state = {
-                "auth_key": auth_key,
-                "metadata": list(_EMPTY_CONVERSATION_METADATA),
-                "updated_at": int(time.time()),
-            }
+            state = _conversation_state(auth_key)
             _conversation_states[key] = state
         return list(state["metadata"])
 
@@ -442,11 +537,19 @@ def _update_conversation_metadata(raw: str, auth: dict, conversation_id: str = N
     if latest:
         _load_conversation_store()
         with _conversation_lock:
-            _conversation_states[_conversation_key(conversation_id)] = {
-                "auth_key": _auth_key(auth),
-                "metadata": list(latest),
-                "updated_at": int(time.time()),
-            }
+            key = _conversation_key(conversation_id)
+            state = _conversation_states.get(key)
+            if not state or state.get("auth_key") != _auth_key(auth):
+                state = _conversation_state(_auth_key(auth))
+                _conversation_states[key] = state
+            state["metadata"] = list(latest)
+            state["updated_at"] = int(time.time())
+            if state.get("recovery_pending"):
+                history = list(state.get("rollover_history") or [])
+                if history:
+                    history[-1] = dict(history[-1], status="recovered")
+                    state["rollover_history"] = history
+                state["recovery_pending"] = False
             if conversation_id:
                 _save_conversation_store()
 
@@ -562,6 +665,16 @@ class GeminiUpstreamError(RuntimeError):
     def __init__(self, code: int):
         self.code = code
         super().__init__(f"Gemini upstream rejected request: error {code}")
+
+
+RECOVERABLE_THREAD_ERROR_CODES = frozenset({1096, 1097})
+
+
+def is_recoverable_thread_error(error) -> bool:
+    return (
+        isinstance(error, GeminiUpstreamError)
+        and error.code in RECOVERABLE_THREAD_ERROR_CODES
+    )
 
 
 def _extract_upstream_error_code(raw: str):

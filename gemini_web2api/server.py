@@ -1,5 +1,6 @@
 """HTTP server: OpenAI-compatible API endpoints."""
 import hashlib
+import itertools
 import json
 import time
 import uuid
@@ -10,18 +11,32 @@ from socketserver import ThreadingMixIn
 from urllib.parse import unquote
 
 from .config import CONFIG
-from .models import MODELS, configured_model_combos, resolve_model_chain
+from .models import (
+    MODELS,
+    configured_model_combos,
+    configured_model_definitions,
+    delete_model_combo,
+    effective_model_definitions,
+    reset_model_definition,
+    resolve_model_chain,
+    save_model_combo,
+    save_model_definition,
+)
 from .gemini import (
     GeminiUpstreamError,
     active_conversation_id,
+    auth_status,
     conversation_info,
     create_conversation,
     generate,
     generate_stream,
     list_conversations,
     log,
+    mark_conversation_recovery_failed,
     refresh_auth,
     reset_conversation,
+    rotate_conversation_thread,
+    is_recoverable_thread_error,
     select_conversation,
 )
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
@@ -32,25 +47,48 @@ from . import __version__
 _chat_history_lock = threading.Lock()
 _chat_history = []
 _chat_histories = {}
+_runtime_stats_lock = threading.Lock()
+_runtime_stats = {
+    "started_at": int(time.time()),
+    "requests": 0,
+    "successes": 0,
+    "failures": 0,
+    "rollovers": 0,
+    "last_error": None,
+}
 _CONVERSATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-_CONVERSATION_MANAGER_HTML = """<!doctype html>
+_SESSION_MANAGER_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Gemini Conversations</title><style>
-:root{color-scheme:dark;font:16px system-ui;background:#111827;color:#e5e7eb}body{max-width:760px;margin:40px auto;padding:0 16px}h1{margin-bottom:4px}.muted{color:#9ca3af}section{background:#1f2937;border:1px solid #374151;border-radius:12px;padding:18px;margin:18px 0}input,button{font:inherit;border-radius:7px;border:1px solid #4b5563;padding:9px;background:#111827;color:#e5e7eb}input{box-sizing:border-box;width:100%;margin:5px 0 12px}button{cursor:pointer;background:#2563eb;border-color:#2563eb;margin:3px}button.danger{background:#991b1b;border-color:#991b1b}button.secondary{background:#374151;border-color:#4b5563}.row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 0;border-top:1px solid #374151}.row:first-child{border-top:0}.id{font-weight:650;overflow-wrap:anywhere}.active{color:#86efac;font-size:.85em}#status{min-height:24px;color:#fbbf24}code{background:#111827;padding:2px 5px;border-radius:4px}</style></head>
-<body><h1>Gemini Conversations</h1><p class="muted">Create or select the session used by clients that do not send <code>X-Conversation-ID</code>.</p>
-<section><label>Local API key <span class="muted">(leave empty when api_keys is [])</span></label><input id="key" type="password" autocomplete="off" placeholder="Optional"><button class="secondary" onclick="saveKey()">Save key in this browser</button></section>
-<section><label>New conversation name</label><input id="newId" maxlength="128" placeholder="my-overlay-chat"><button onclick="createConversation()">Create and select</button></section>
-<section><div id="status"></div><div id="list">Loading…</div></section>
+<title>Gemini Web2API Session Manager</title><style>
+:root{color-scheme:dark;font:15px system-ui;background:#111827;color:#e5e7eb}body{max-width:980px;margin:32px auto;padding:0 16px}h1{margin-bottom:4px}h2{margin:0 0 12px}.muted{color:#9ca3af}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.card,section{background:#1f2937;border:1px solid #374151;border-radius:12px;padding:16px;margin:16px 0}.card{margin:0}.value{font-size:1.35rem;font-weight:700;overflow-wrap:anywhere}input,select,button{font:inherit;border-radius:7px;border:1px solid #4b5563;padding:9px;background:#111827;color:#e5e7eb}input,select{box-sizing:border-box;width:100%;margin:5px 0 12px}button{cursor:pointer;background:#2563eb;border-color:#2563eb;margin:3px}button.danger{background:#991b1b;border-color:#991b1b}button.secondary{background:#374151;border-color:#4b5563}button:disabled{opacity:.5;cursor:not-allowed}.row{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:12px 0;border-top:1px solid #374151}.row:first-child{border-top:0}.grow{flex:1;min-width:0}.id{font-weight:700;overflow-wrap:anywhere}.meta{color:#9ca3af;font-size:.85em;margin-top:4px}.badge{display:inline-block;border-radius:999px;padding:2px 8px;margin:3px 5px 0 0;font-size:.78em;background:#374151}.Healthy{background:#166534}.Recovered{background:#1d4ed8}.Empty{background:#4b5563}.Error{background:#991b1b}.active{color:#86efac}#status{min-height:24px;color:#86efac}.history{margin:6px 0 0;padding-left:20px;color:#d1d5db;font-size:.82em}code{background:#111827;padding:2px 5px;border-radius:4px}@media(max-width:620px){.row{display:block}.row>div:last-child{margin-top:8px}}</style></head>
+<body><h1>Session Manager</h1><p class="muted">Manage stable local sessions, upstream Gemini thread rollover, runtime health, and custom model chains.</p>
+<section><label>Local API key <span class="muted">(leave empty when api_keys is [])</span></label><input id="key" type="password" autocomplete="off" placeholder="Optional"><button class="secondary" id="saveKey">Save key in this browser</button><div id="status"></div></section>
+<div id="stats" class="grid"><div class="card">Loading runtime stats…</div></div>
+<section><h2>Sessions</h2><p class="muted">Reset clears only current Gemini Web thread. Local session and rollover history stay.</p><label>New session name</label><input id="newId" maxlength="128" placeholder="my-overlay-chat"><button id="createSession">Create and select</button><div id="sessions">Loading…</div></section>
+<section id="models"><h2>Model Manager</h2><p class="muted">Raw model definitions and custom chains persist in <code>config.json</code>. Reset restores hardcoded defaults.</p><h3>Raw model</h3><input id="rawName" maxlength="128" placeholder="gemini-new-model"><label>Mode (1–6)</label><input id="rawMode" type="number" min="1" max="6" value="1"><label>Think (0–4)</label><input id="rawThink" type="number" min="0" max="4" value="4"><input id="rawDesc" maxlength="500" placeholder="Description"><input id="rawExtra" placeholder='Optional extra JSON, e.g. {"31":2,"80":3}'><button id="saveRaw">Add raw model</button><button class="secondary" id="cancelRawEdit" hidden>Cancel edit</button><h3>Custom chain</h3><input id="modelName" maxlength="128" placeholder="my-model-chain"><select id="strategy"><option value="fallback">fallback</option><option value="round_robin">round_robin</option></select><input id="modelList" placeholder="gemini-3.7-flash, gemini-3.6-flash"><button id="saveModel">Add model chain</button><button class="secondary" id="cancelEdit" hidden>Cancel edit</button><div id="modelRows">Loading…</div></section>
 <script>
-const key=document.querySelector('#key'),statusEl=document.querySelector('#status'),list=document.querySelector('#list');key.value=localStorage.getItem('gemini-api-key')||'';
+const $=s=>document.querySelector(s),key=$('#key'),statusEl=$('#status');key.value=localStorage.getItem('gemini-api-key')||'';let editing=null,rawEditing=null;
 function headers(json=false){const h={};if(json)h['Content-Type']='application/json';if(key.value)h.Authorization='Bearer '+key.value;return h}
-function saveKey(){localStorage.setItem('gemini-api-key',key.value);load()}
 async function request(path,options={}){options.headers={...headers(Boolean(options.body)),...(options.headers||{})};const response=await fetch(path,options);let data;try{data=await response.json()}catch{throw Error('Invalid server response')}if(!response.ok)throw Error(data.error?.message||data.error||('HTTP '+response.status));return data}
+function text(tag,value,cls=''){const node=document.createElement(tag);node.textContent=value;if(cls)node.className=cls;return node}
 function setStatus(message,error=false){statusEl.textContent=message;statusEl.style.color=error?'#fca5a5':'#86efac'}
-async function load(){try{const data=await request('/v1/conversations');const items=data.data||[];list.innerHTML=items.length?'':'<p class="muted">No saved conversations.</p>';for(const item of items){const row=document.createElement('div');row.className='row';const label=document.createElement('div');label.innerHTML='<div class="id"></div>'+(item.active?'<div class="active">Active</div>':'');label.querySelector('.id').textContent=item.id;const actions=document.createElement('div');const select=document.createElement('button');select.textContent='Select';select.disabled=item.active;select.onclick=()=>act(item.id,'select');const reset=document.createElement('button');reset.textContent='Reset';reset.className='danger';reset.onclick=()=>{if(confirm('Reset and remove '+item.id+'?'))act(item.id,'reset')};actions.append(select,reset);row.append(label,actions);list.append(row)}setStatus('')}catch(error){list.innerHTML='';setStatus(error.message,true)}}
-async function createConversation(){const id=document.querySelector('#newId').value.trim();if(!id)return setStatus('Enter a conversation name.',true);try{await request('/v1/conversations',{method:'POST',body:JSON.stringify({id})});document.querySelector('#newId').value='';setStatus('Created and selected '+id);await load()}catch(error){setStatus(error.message,true)}}
-async function act(id,action){try{await request('/v1/conversations/'+encodeURIComponent(id)+'/'+action,{method:'POST',body:'{}'});setStatus((action==='select'?'Selected ':'Reset ')+id);await load()}catch(error){setStatus(error.message,true)}}
-load();
+function button(label,action,cls=''){const node=text('button',label,cls);node.onclick=action;return node}
+function stat(label,value){const card=document.createElement('div');card.className='card';card.append(text('div',label,'muted'),text('div',String(value??'—'),'value'));return card}
+async function loadStats(){const data=await request('/v1/stats');const root=$('#stats');root.innerHTML='';root.append(stat('Auth',data.auth.state+(data.auth.error?' (error)':'')),stat('Active session',data.active_session||'none'),stat('Requests',data.requests),stat('Successes',data.successes),stat('Failures',data.failures),stat('Rollovers',data.rollovers),stat('Uptime',data.uptime_seconds+'s'),stat('Custom models',data.custom_models));}
+async function loadSessions(){const data=await request('/v1/conversations'),root=$('#sessions');root.innerHTML='';if(!(data.data||[]).length)root.append(text('p','No saved sessions.','muted'));for(const item of data.data||[]){const row=document.createElement('div');row.className='row';const info=document.createElement('div');info.className='grow';const title=text('div',item.id,'id');title.append(text('span',' '+item.health,'badge '+item.health));if(item.active)title.append(text('span',' Active','active'));info.append(title,text('div','Thread generation '+item.thread_generation+' · rollovers '+item.rollover_count+(item.last_error?' · last error '+item.last_error:''),'meta'));if((item.rollover_history||[]).length){const history=document.createElement('ul');history.className='history';for(const event of item.rollover_history.slice().reverse().slice(0,5))history.append(text('li','Generation '+event.generation+' · error '+event.error+' · '+event.status+' · '+new Date(event.time*1000).toLocaleString()));info.append(history)}const actions=document.createElement('div');const select=button('Select',()=>sessionAction(item.id,'select'));select.disabled=item.active;const reset=button('Reset thread',()=>{if(confirm('Clear Gemini Web thread for '+item.id+'? Local session and rollover history will stay.'))sessionAction(item.id,'reset')},'danger');actions.append(select,reset);row.append(info,actions);root.append(row)}}
+async function loadModels(){const data=await request('/v1/model-config'),root=$('#modelRows');root.innerHTML='';root.append(text('h3','Custom chains'));if(!data.custom.length)root.append(text('p','No custom model chains.','muted'));for(const item of data.custom){const row=document.createElement('div');row.className='row';const info=document.createElement('div');info.className='grow';info.append(text('div',item.name,'id'),text('div',item.strategy+' · '+item.models.join(' → '),'meta'));const actions=document.createElement('div');actions.append(button('Edit',()=>editModel(item),'secondary'),button('Delete',()=>deleteModel(item.name),'danger'));row.append(info,actions);root.append(row)}root.append(text('h3','Raw models'));for(const item of data.builtins){const row=document.createElement('div');row.className='row';const info=document.createElement('div');info.className='grow';info.append(text('div',item.name+(item.customized?' · customized':item.default?' · default':' · added'),'id'),text('div','mode '+item.mode+' · think '+item.think+(item.description?' · '+item.description:''),'meta'));const actions=document.createElement('div');actions.append(button('Edit',()=>editRaw(item),'secondary'));if(item.customized)actions.append(button(item.default?'Reset default':'Delete',()=>resetRaw(item),'danger'));row.append(info,actions);root.append(row)}}
+async function load(){try{await Promise.all([loadStats(),loadSessions(),loadModels()]);setStatus('')}catch(error){setStatus(error.message,true)}}
+async function createSession(){const id=$('#newId').value.trim();if(!id)return setStatus('Enter a session name.',true);try{await request('/v1/conversations',{method:'POST',body:JSON.stringify({id})});$('#newId').value='';setStatus('Created and selected '+id);await load()}catch(error){setStatus(error.message,true)}}
+async function sessionAction(id,action){try{await request('/v1/conversations/'+encodeURIComponent(id)+'/'+action,{method:'POST',body:'{}'});setStatus((action==='select'?'Selected ':'Reset thread for ')+id);await load()}catch(error){setStatus(error.message,true)}}
+function editModel(item){editing=item.name;$('#modelName').value=item.name;$('#modelName').disabled=true;$('#strategy').value=item.strategy;$('#modelList').value=item.models.join(', ');$('#saveModel').textContent='Save changes';$('#cancelEdit').hidden=false;location.hash='models'}
+function clearModelForm() {editing=null;$('#modelName').value='';$('#modelName').disabled=false;$('#strategy').value='fallback';$('#modelList').value='';$('#saveModel').textContent='Add model chain';$('#cancelEdit').hidden=true}
+async function saveModel(){const name=(editing||$('#modelName').value).trim(),models=$('#modelList').value.split(',').map(v=>v.trim()).filter(Boolean),body=JSON.stringify({name,strategy:$('#strategy').value,models});if(!name||!models.length)return setStatus('Enter model-chain name and at least one built-in model.',true);try{await request(editing?'/v1/model-config/'+encodeURIComponent(editing):'/v1/model-config',{method:editing?'PUT':'POST',body});setStatus((editing?'Updated ':'Created ')+name);clearModelForm();await load()}catch(error){setStatus(error.message,true)}}
+async function deleteModel(name){if(!confirm('Delete custom model chain '+name+'?'))return;try{await request('/v1/model-config/'+encodeURIComponent(name),{method:'DELETE'});setStatus('Deleted '+name);if(editing===name)clearModelForm();await load()}catch(error){setStatus(error.message,true)}}
+function editRaw(item){rawEditing=item.name;$('#rawName').value=item.name;$('#rawName').disabled=true;$('#rawMode').value=item.mode;$('#rawThink').value=item.think;$('#rawDesc').value=item.description||'';$('#rawExtra').value=item.extra?JSON.stringify(item.extra):'';$('#saveRaw').textContent='Save raw model';$('#cancelRawEdit').hidden=false;location.hash='models'}
+function clearRawForm(){rawEditing=null;$('#rawName').value='';$('#rawName').disabled=false;$('#rawMode').value='1';$('#rawThink').value='4';$('#rawDesc').value='';$('#rawExtra').value='';$('#saveRaw').textContent='Add raw model';$('#cancelRawEdit').hidden=true}
+async function saveRaw(){const name=(rawEditing||$('#rawName').value).trim();if(!name)return setStatus('Enter raw model name.',true);let extra;try{extra=$('#rawExtra').value.trim()?JSON.parse($('#rawExtra').value):undefined}catch{return setStatus('Extra must be valid JSON.',true)}const body=JSON.stringify({name,mode:Number($('#rawMode').value),think:Number($('#rawThink').value),desc:$('#rawDesc').value,...(extra===undefined?{}:{extra})});try{await request(rawEditing?'/v1/model-definitions/'+encodeURIComponent(rawEditing):'/v1/model-definitions',{method:rawEditing?'PUT':'POST',body});setStatus((rawEditing?'Updated ':'Created ')+name);clearRawForm();await load()}catch(error){setStatus(error.message,true)}}
+async function resetRaw(item){const action=item.default?'Reset '+item.name+' to hardcoded default?':'Delete raw model '+item.name+'?';if(!confirm(action))return;try{await request('/v1/model-definitions/'+encodeURIComponent(item.name),{method:'DELETE'});setStatus((item.default?'Reset ':'Deleted ')+item.name);if(rawEditing===item.name)clearRawForm();await load()}catch(error){setStatus(error.message,true)}}
+$('#saveKey').onclick=()=>{localStorage.setItem('gemini-api-key',key.value);load()};$('#createSession').onclick=createSession;$('#saveModel').onclick=saveModel;$('#cancelEdit').onclick=clearModelForm;$('#saveRaw').onclick=saveRaw;$('#cancelRawEdit').onclick=clearRawForm;load();setInterval(loadStats,5000);
 </script></body></html>"""
 
 
@@ -107,8 +145,37 @@ def _usage(prompt: str, text: str) -> dict:
     return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
 
 
+def _stats_begin() -> None:
+    with _runtime_stats_lock:
+        _runtime_stats["requests"] += 1
+
+
+def _stats_success() -> None:
+    with _runtime_stats_lock:
+        _runtime_stats["successes"] += 1
+
+
+def _stats_failure(error) -> None:
+    message = str(error or "request failed").strip().replace("\n", " ")[:240]
+    with _runtime_stats_lock:
+        _runtime_stats["failures"] += 1
+        _runtime_stats["last_error"] = message or "request failed"
+
+
+def _stats_rollover() -> None:
+    with _runtime_stats_lock:
+        _runtime_stats["rollovers"] += 1
+
+
+def _stats_snapshot() -> dict:
+    with _runtime_stats_lock:
+        snapshot = dict(_runtime_stats)
+    snapshot["uptime_seconds"] = max(0, int(time.time()) - snapshot["started_at"])
+    return snapshot
+
+
 def _model_catalog() -> dict:
-    catalog = dict(MODELS)
+    catalog = effective_model_definitions()
     for name, configured in configured_model_combos().items():
         if isinstance(configured, list):
             strategy, models = "fallback", configured
@@ -121,6 +188,42 @@ def _model_catalog() -> dict:
                 and strategy in ("fallback", "round_robin")):
             catalog[name] = {"desc": f"Configured model {strategy} chain"}
     return catalog
+
+
+def _model_config_payload() -> dict:
+    custom = []
+    for name, configured in configured_model_combos().items():
+        if isinstance(configured, list):
+            strategy, models = "fallback", configured
+        elif isinstance(configured, dict):
+            strategy = configured.get("strategy", "fallback")
+            models = configured.get("models", [])
+        else:
+            continue
+        if isinstance(name, str) and isinstance(models, list):
+            custom.append({
+                "name": name,
+                "strategy": strategy,
+                "models": list(models),
+                "read_only": False,
+            })
+    customized = configured_model_definitions()
+    return {
+        "builtins": [
+            {
+                "name": name,
+                "mode": config["mode"],
+                "think": config["think"],
+                "description": config.get("desc", ""),
+                "extra": config.get("extra"),
+                "default": name in MODELS,
+                "customized": name in customized,
+                "read_only": False,
+            }
+            for name, config in effective_model_definitions().items()
+        ],
+        "custom": custom,
+    }
 
 
 def _generate_attempts(prompt, attempts, file_refs, combo, conversation_id=None):
@@ -241,6 +344,31 @@ def _upload_images(images: list) -> list:
     return file_refs if file_refs else None
 
 
+def _rollover_chat_context(error, messages, tools, tool_choice, conversation_id):
+    """Rebuild a rejected Gemini thread once from the client's full chat history."""
+    if not is_recoverable_thread_error(error):
+        raise error
+    info = conversation_info(conversation_id)
+    if not info or not all(info.get("metadata", [])[:3]):
+        raise error
+    recovery_prompt, recovery_images = messages_to_prompt(messages, tools, tool_choice)
+    if not recovery_prompt.strip():
+        raise error
+    recovery_file_refs = _upload_images(recovery_images)
+    rotate_conversation_thread(
+        conversation_id,
+        error_code=error.code,
+        recovery="full-history",
+    )
+    _stats_rollover()
+    log(
+        f"Gemini thread rollover: conversation={conversation_id or 'default'} "
+        f"trigger={error.code} recovery=full-history "
+        f"messages={len(messages) if isinstance(messages, list) else 0}"
+    )
+    return recovery_prompt, recovery_images, recovery_file_refs
+
+
 class GeminiHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -353,7 +481,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
         self.end_headers()
 
@@ -364,8 +492,22 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
             path = self.path.split("?", 1)[0]
-            if path == "/conversations":
-                self.send_html(_CONVERSATION_MANAGER_HTML)
+            if path in ("/conversations", "/sessions"):
+                self.send_html(_SESSION_MANAGER_HTML)
+            elif path == "/v1/stats":
+                stats = _stats_snapshot()
+                auth = auth_status()
+                sessions = list_conversations()
+                stats["auth"] = {
+                    "state": "authenticated" if auth["loaded"] else "anonymous",
+                    "error": bool(auth["error"]),
+                }
+                stats["active_session"] = active_conversation_id()
+                stats["sessions"] = len(sessions)
+                stats["custom_models"] = len(configured_model_combos())
+                self.send_json(stats)
+            elif path == "/v1/model-config":
+                self.send_json(_model_config_payload())
             elif path == "/v1/models":
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
@@ -385,7 +527,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     for n, c in _model_catalog().items()
                 ]})
             elif path == "/":
-                self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
+                self.send_json({"status": "ok", "version": __version__, "models": list(effective_model_definitions())})
             else:
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -407,6 +549,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self._handle_responses(body)
             elif path == "/v1/conversations":
                 self._handle_conversation_create(body)
+            elif path == "/v1/model-config":
+                self._handle_model_config_create(body)
+            elif path == "/v1/model-definitions":
+                self._handle_model_definition_create(body)
             elif path.startswith("/v1/conversations/") and path.endswith("/select"):
                 self._handle_conversation_select(path)
             elif path.startswith("/v1/conversations/") and path.endswith("/reset"):
@@ -429,6 +575,124 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": {"message": str(e)}}, 500)
             except:
                 pass
+
+    def do_PUT(self):
+        try:
+            refresh_auth()
+            if self.path.startswith("/v1") and not self._authorized():
+                self.send_json({"error": {"message": "invalid api key"}}, 401)
+                return
+            body = self._read_request_body()
+            path = self.path.split("?", 1)[0]
+            if path.startswith("/v1/model-config/"):
+                self._handle_model_config_update(path, body)
+            elif path.startswith("/v1/model-definitions/"):
+                self._handle_model_definition_update(path, body)
+            else:
+                self.send_json({"error": "not found"}, 404)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except ValueError as error:
+            self.send_json({"error": {"message": str(error)}}, 400)
+        except Exception as error:
+            log(f"PUT error: {error}")
+            try:
+                self.send_json({"error": {"message": str(error)}}, 500)
+            except Exception:
+                pass
+
+    def do_DELETE(self):
+        try:
+            refresh_auth()
+            if self.path.startswith("/v1") and not self._authorized():
+                self.send_json({"error": {"message": "invalid api key"}}, 401)
+                return
+            path = self.path.split("?", 1)[0]
+            if path.startswith("/v1/model-config/"):
+                name = self._model_config_path_name(path)
+                if delete_model_combo(name):
+                    self.send_json({"name": name, "deleted": True})
+                else:
+                    self.send_json({"error": {"message": "model combo not found"}}, 404)
+            elif path.startswith("/v1/model-definitions/"):
+                name = self._model_definition_path_name(path)
+                if reset_model_definition(name):
+                    self.send_json({
+                        "name": name,
+                        "reset": name in MODELS,
+                        "deleted": name not in MODELS,
+                    })
+                else:
+                    self.send_json({"error": {"message": "model override not found"}}, 404)
+            else:
+                self.send_json({"error": "not found"}, 404)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except ValueError as error:
+            self.send_json({"error": {"message": str(error)}}, 400)
+        except Exception as error:
+            log(f"DELETE error: {error}")
+            try:
+                self.send_json({"error": {"message": str(error)}}, 500)
+            except Exception:
+                pass
+
+    def _model_config_path_name(self, path: str) -> str:
+        prefix = "/v1/model-config/"
+        name = unquote(path[len(prefix):]).strip()
+        if not name or "/" in name:
+            raise ValueError("model combo name is required")
+        return name
+
+    def _model_definition_path_name(self, path: str) -> str:
+        prefix = "/v1/model-definitions/"
+        name = unquote(path[len(prefix):]).strip()
+        if not name or "/" in name:
+            raise ValueError("model name is required")
+        return name
+
+    def _handle_model_definition_create(self, body: bytes):
+        req = self._parse_body(body)
+        if req is None or not isinstance(req, dict):
+            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            return
+        name = req.get("name")
+        if isinstance(name, str) and name.strip() in effective_model_definitions():
+            self.send_json({"error": {"message": "model already exists; use PUT to edit"}}, 409)
+            return
+        self.send_json(save_model_definition(name, req), 201)
+
+    def _handle_model_definition_update(self, path: str, body: bytes):
+        name = self._model_definition_path_name(path)
+        req = self._parse_body(body)
+        if req is None or not isinstance(req, dict):
+            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            return
+        self.send_json(save_model_definition(name, req))
+
+    def _handle_model_config_create(self, body: bytes):
+        req = self._parse_body(body)
+        if req is None or not isinstance(req, dict):
+            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            return
+        name = req.get("name")
+        if isinstance(name, str) and name.strip() in configured_model_combos():
+            self.send_json({"error": {"message": "model combo already exists"}}, 409)
+            return
+        saved = save_model_combo(name, req)
+        self.send_json(saved, 201)
+
+    def _handle_model_config_update(self, path: str, body: bytes):
+        name = self._model_config_path_name(path)
+        if name not in configured_model_combos():
+            self.send_json({"error": {"message": "model combo not found"}}, 404)
+            return
+        req = self._parse_body(body)
+        if req is None or not isinstance(req, dict):
+            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            return
+        saved = save_model_combo(name, req)
+        self.send_json(saved)
 
     def _conversation_path_id(self, path: str, action: str) -> str:
         prefix = "/v1/conversations/"
@@ -514,20 +778,45 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
 
+        _stats_begin()
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         try:
             file_refs = _upload_images(images)
         except ImageAuthenticationRequired as e:
+            _stats_failure(e)
             self.send_json({"error": {"message": str(e)}}, 400)
             return
         except RuntimeError as e:
+            _stats_failure(e)
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
         if stream and (not tools or tool_choice == "none"):
+            effective_prompt = prompt
+            effective_images = images
+            sse_started = False
+            rolled_over = False
             try:
+                stream_iter = _generate_stream_attempts(
+                    effective_prompt, attempts, file_refs, combo, conversation_id
+                )
+                try:
+                    first_delta = next(stream_iter)
+                except Exception as error:
+                    if not is_recoverable_thread_error(error):
+                        raise
+                    effective_prompt, effective_images, recovery_file_refs = _rollover_chat_context(
+                        error, messages, tools, tool_choice, conversation_id
+                    )
+                    rolled_over = True
+                    stream_iter = _generate_stream_attempts(
+                        effective_prompt, attempts, recovery_file_refs, combo, conversation_id
+                    )
+                    first_delta = next(stream_iter)
+
                 self._start_sse(conversation_id)
+                sse_started = True
                 first_chunk = {
                     "id": cid,
                     "object": "chat.completion.chunk",
@@ -540,7 +829,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     }],
                 }
                 self._write_sse(f"data: {json.dumps(first_chunk)}\n\n")
-                for delta in _generate_stream_attempts(prompt, attempts, file_refs, combo, conversation_id):
+                for delta in itertools.chain((first_delta,), stream_iter):
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
                     self._write_sse(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n")
@@ -550,18 +839,55 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self._write_sse(b"data: [DONE]\n\n")
                 self._finish_sse()
                 _commit_chat_messages(messages, conversation_id)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+                _stats_success()
+            except (BrokenPipeError, ConnectionResetError) as e:
+                _stats_failure(e)
             except Exception as e:
-                log(f"Stream error: {e}")
+                if rolled_over:
+                    mark_conversation_recovery_failed(
+                        conversation_id,
+                        error_code=e.code if isinstance(e, GeminiUpstreamError) else None,
+                    )
+                _stats_failure(e)
+                if not sse_started:
+                    message, status = _upstream_error_response(e, bool(effective_images))
+                    self.send_json({"error": {"message": message}}, status)
+                else:
+                    log(f"Stream error: {e}")
+                    self._finish_sse()
             return
 
+        effective_prompt = prompt
+        effective_images = images
         try:
-            text = _generate_attempts(prompt, attempts, file_refs, combo, conversation_id)
-        except Exception as e:
-            message, status = _upstream_error_response(e, bool(images))
-            self.send_json({"error": {"message": message}}, status)
-            return
+            text = _generate_attempts(effective_prompt, attempts, file_refs, combo, conversation_id)
+        except Exception as error:
+            if is_recoverable_thread_error(error):
+                try:
+                    effective_prompt, effective_images, recovery_file_refs = _rollover_chat_context(
+                        error, messages, tools, tool_choice, conversation_id
+                    )
+                    text = _generate_attempts(
+                        effective_prompt, attempts, recovery_file_refs, combo, conversation_id
+                    )
+                except Exception as recovery_error:
+                    mark_conversation_recovery_failed(
+                        conversation_id,
+                        error_code=(
+                            recovery_error.code
+                            if isinstance(recovery_error, GeminiUpstreamError)
+                            else None
+                        ),
+                    )
+                    message, status = _upstream_error_response(recovery_error, bool(effective_images))
+                    _stats_failure(recovery_error)
+                    self.send_json({"error": {"message": message}}, status)
+                    return
+            else:
+                message, status = _upstream_error_response(error, bool(effective_images))
+                _stats_failure(error)
+                self.send_json({"error": {"message": message}}, status)
+                return
 
         _commit_chat_messages(messages, conversation_id)
         tool_calls = None
@@ -584,9 +910,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 "id": cid, "object": "chat.completion", "created": int(time.time()),
                 "model": model_name, "conversation_id": conversation_id,
                 "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-                "usage": {"prompt_tokens": len(prompt)//4, "completion_tokens": len(text or "")//4,
-                          "total_tokens": (len(prompt)+len(text or ""))//4},
+                "usage": {"prompt_tokens": len(effective_prompt)//4, "completion_tokens": len(text or "")//4,
+                          "total_tokens": (len(effective_prompt)+len(text or ""))//4},
             }, conversation_id=conversation_id)
+        _stats_success()
 
     # ─── /v1/responses (Codex CLI) ───────────────────────────────────────────
 
@@ -659,13 +986,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
+        _stats_begin()
         try:
             file_refs = _upload_images(images)
             text = _generate_attempts(prompt, attempts, file_refs, combo, conversation_id)
         except ImageAuthenticationRequired as e:
+            _stats_failure(e)
             self.send_json({"error": {"message": str(e)}}, 400)
             return
         except Exception as e:
+            _stats_failure(e)
             message, status = _upstream_error_response(e, bool(images))
             self.send_json({"error": {"message": message}}, status)
             return
@@ -825,6 +1155,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                             "model": model_name, "conversation_id": conversation_id, "output": output,
                             "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text or "")//4, "total_tokens": (len(prompt)+len(text or ""))//4}},
                            conversation_id=conversation_id)
+        _stats_success()
 
     # ─── /v1beta/models (Google Gemini CLI) ──────────────────────────────────
 
@@ -857,12 +1188,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty content"}}, 400)
             return
 
+        _stats_begin()
         try:
             file_refs = _upload_images(images)
         except ImageAuthenticationRequired as e:
+            _stats_failure(e)
             self.send_json({"error": {"message": str(e)}}, 400)
             return
         except RuntimeError as e:
+            _stats_failure(e)
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
         log(f"Google API: model={model_name} stream={stream} tools={has_tools} prompt_len={len(prompt)}")
@@ -891,15 +1225,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 }
                 self._write_sse(f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n")
                 self._finish_sse()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+                _stats_success()
+            except (BrokenPipeError, ConnectionResetError) as error:
+                _stats_failure(error)
             except Exception as e:
+                _stats_failure(e)
                 log(f"Google stream error: {e}")
             return
 
         try:
             text = _generate_attempts(prompt, attempts, file_refs, combo, conversation_id)
         except Exception as e:
+            _stats_failure(e)
             message, status = _upstream_error_response(e, bool(images))
             self.send_json({"error": {"message": message}}, status)
             return
@@ -943,6 +1280,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         else:
             response_obj["conversationId"] = conversation_id
             self.send_json(response_obj, conversation_id=conversation_id)
+        _stats_success()
 
 
 class ThreadedServer(ThreadingMixIn, HTTPServer):

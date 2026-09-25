@@ -4,7 +4,7 @@ import os
 import sys
 
 from .config import CONFIG, load_config, find_config
-from .models import MODELS
+from .models import effective_model_definitions
 from .gemini import HAS_HTTPX, auth_status, log
 from .server import GeminiHandler, ThreadedServer
 from . import __version__
@@ -57,7 +57,7 @@ def main():
         print(f"gemini-web2api v{__version__}")
         print(f"  Listening: http://0.0.0.0:{port}")
         print(f"  Base URL:  http://localhost:{port}/v1")
-        print(f"  Models:    {', '.join(MODELS.keys())}")
+        print(f"  Models:    {', '.join(effective_model_definitions())}")
         print(f"  Cookie:    {cookie_status}")
         print(f"  Proxy:     {CONFIG.get('proxy') or 'system env'}")
         print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
